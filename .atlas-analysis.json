@@ -1,0 +1,108 @@
+{
+  "projectType": "framework",
+  "projectName": "Faramesh",
+  "projectDescription": "Unified governance plane for AI agents with pre-execution authorization, policy-as-code, and tamper-evident audit trail",
+  "theme": "aspen",
+  "primaryColor": "#8434f4",
+  "lightColor": "#7c7c7c",
+  "darkColor": "#060606",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/policy-engine",
+              "concepts/adapters",
+              "concepts/dpr-chain",
+              "concepts/defer-workflow",
+              "concepts/wal-ordering"
+            ]
+          },
+          {
+            "group": "Integration Guides",
+            "pages": [
+              "integrations/python-sdk",
+              "integrations/langchain",
+              "integrations/daemon-mode",
+              "integrations/serverless",
+              "integrations/mcp-gateway",
+              "integrations/kubernetes"
+            ]
+          },
+          {
+            "group": "Policy Reference",
+            "pages": [
+              "policy/overview",
+              "policy/syntax",
+              "policy/rules",
+              "policy/expressions",
+              "policy/validation",
+              "policy/examples"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/multi-agent",
+              "advanced/credentials",
+              "advanced/security",
+              "advanced/observability",
+              "advanced/cloud-platform"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "CLI Reference",
+        "groups": [
+          {
+            "group": "Commands",
+            "pages": [
+              "cli/demo",
+              "cli/init",
+              "cli/serve",
+              "cli/policy",
+              "cli/audit",
+              "cli/agent",
+              "cli/auth"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Pre-execution policy enforcement with PERMIT/DENY/DEFER decisions",
+    "Policy-as-code with YAML and expr-lang expression evaluation",
+    "Tamper-evident DPR (Decision-Provenance Record) audit chain",
+    "WAL-first ordering guarantees no execution without audit record",
+    "Human-in-the-loop DEFER workflow for approval-required actions",
+    "Six deployment adapters from SDK shim to eBPF kernel probes",
+    "Multi-agent governance with session state and budget management",
+    "Credential brokering and workload identity integration"
+  ],
+  "publicApiSurface": [
+    "govern() - Python decorator for wrapping callable functions",
+    "faramesh demo - Interactive demonstration command",
+    "faramesh serve - Start governance daemon",
+    "faramesh policy validate - Validate policy files",
+    "faramesh audit tail - Stream live governance decisions",
+    "faramesh agent approve/deny - Resolve DEFER actions",
+    "faramesh agent kill - Activate agent kill switch",
+    "CanonicalActionRequest - Core request type",
+    "Decision - Governance decision type with Effect (PERMIT/DENY/DEFER)",
+    "Policy YAML schema - Rules, conditions, effects, reason codes"
+  ]
+}
