@@ -1,0 +1,490 @@
+---
+title: Serverless Deployment
+description: Deploy Faramesh in Lambda, Cloud Functions, and Cloud Run with fast cold starts
+---
+
+The **A4 Serverless** adapter runs Faramesh **in-process** inside your serverless function — no daemon, no network hop, no sidecars. Designed for cold-start optimization (&lt;50ms initialization), it's the recommended deployment pattern for:
+
+- AWS Lambda
+- Google Cloud Functions
+- Google Cloud Run
+- Azure Functions
+- Any ephemeral compute environment
+
+## Architecture
+
+```
+Lambda Handler ──► [In-Process Faramesh] ──► Pipeline ──► Decision ──► Function Logic
+                   (no network hop)
+```
+
+The governance engine runs **inside the same process** as your function. No Unix socket, no gRPC, no daemon — just a library call.
+
+## Quick Start
+
+```python lambda_function.py
+import os
+from faramesh.serverless import Guard
+
+# Initialize guard during cold start (reused across invocations)
+guard = Guard(
+    policy_yaml=os.environ['FARAMESH_POLICY'],  # Inline policy from env var
+    agent_id='lambda-payment-bot'
+)
+
+def lambda_handler(event, context):
+    # Parse request
+    amount = event['amount']
+    currency = event['currency']
+    
+    # Govern the action
+    decision = guard.govern(
+        context,
+        tool_id='stripe/refund',
+        args={'amount': amount, 'currency': currency}
+    )
+    
+    if decision.effect == 'DENY':
+        return {
+            'statusCode': 403,
+            'body': f"Denied: {decision.reason}"
+        }
+    
+    if decision.effect == 'DEFER':
+        return {
+            'statusCode': 202,
+            'body': f"Requires approval: {decision.defer_token}"
+        }
+    
+    # PERMIT — execute the actual logic
+    result = process_refund(amount, currency)
+    return {
+        'statusCode': 200,
+        'body': result
+    }
+
+def process_refund(amount: float, currency: str) -> str:
+    # Actual Stripe API call
+    return f"Refunded {amount} {currency}"
+```
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `FARAMESH_POLICY` | Yes (or use `PolicyPath`) | Inline policy YAML |
+| `FARAMESH_AGENT_ID` | No | Agent identity (default: `serverless-agent`) |
+| `FARAMESH_DPR_PATH` | No | SQLite DPR path (default: `/tmp/faramesh-dpr.db`) |
+
+### Guard Initialization
+
+The `Guard` class is designed for cold-start optimization:
+
+```python
+from faramesh.serverless import Guard
+
+# Option 1: Inline YAML from environment variable
+guard = Guard(
+    policy_yaml=os.environ['FARAMESH_POLICY'],
+    agent_id='lambda-bot'
+)
+
+# Option 2: Load from file (if bundled in deployment package)
+guard = Guard(
+    policy_path='./policy.yaml',
+    agent_id='lambda-bot'
+)
+
+# Option 3: Explicit DPR path (Lambda's /tmp is writable)
+guard = Guard(
+    policy_yaml=os.environ['FARAMESH_POLICY'],
+    agent_id='lambda-bot',
+    dpr_path='/tmp/faramesh-dpr.db'
+)
+```
+
+<Note>
+**Cold start optimization**: Initialize `Guard` **outside** the handler function so it's reused across warm invocations. Policy compilation happens once per cold start.
+</Note>
+
+## AWS Lambda Deployment
+
+### Using Lambda Layers
+
+<Steps>
+
+<Step title="Create a Lambda Layer">
+```bash
+# Create layer directory
+mkdir -p faramesh-layer/python
+
+# Install Faramesh SDK
+pip install faramesh -t faramesh-layer/python
+
+# Create layer ZIP
+cd faramesh-layer
+zip -r faramesh-layer.zip python/
+```
+</Step>
+
+<Step title="Upload the layer">
+```bash
+aws lambda publish-layer-version \
+  --layer-name faramesh \
+  --zip-file fileb://faramesh-layer.zip \
+  --compatible-runtimes python3.11 python3.12
+```
+</Step>
+
+<Step title="Attach to your function">
+```bash
+aws lambda update-function-configuration \
+  --function-name my-payment-function \
+  --layers arn:aws:lambda:us-east-1:123456789012:layer:faramesh:1
+```
+</Step>
+
+<Step title="Set environment variables">
+```bash
+aws lambda update-function-configuration \
+  --function-name my-payment-function \
+  --environment Variables="{
+    FARAMESH_POLICY='$(cat policy.yaml | jq -Rs .)',
+    FARAMESH_AGENT_ID='lambda-payment-bot'
+  }"
+```
+</Step>
+
+</Steps>
+
+### Deployment Package Example
+
+```python lambda_function.py
+import os
+from faramesh.serverless import Guard
+import stripe
+
+# Cold start: compile policy once
+guard = Guard(
+    policy_yaml=os.environ['FARAMESH_POLICY'],
+    agent_id=os.environ.get('FARAMESH_AGENT_ID', 'lambda-bot'),
+    dpr_path='/tmp/faramesh-dpr.db'
+)
+
+stripe.api_key = os.environ['STRIPE_API_KEY']
+
+def lambda_handler(event, context):
+    # Extract request ID for session tracking
+    session_id = context.request_id
+    
+    # Govern the refund
+    decision = guard.govern(
+        context,
+        tool_id='stripe/refund',
+        args={
+            'amount': event['amount'],
+            'currency': event['currency']
+        }
+    )
+    
+    if decision.effect == 'DENY':
+        return {
+            'statusCode': 403,
+            'body': f"Policy denied: {decision.reason}"
+        }
+    
+    if decision.effect == 'DEFER':
+        # DEFER in Lambda: return pending response
+        # (approval happens out-of-band via CLI or webhook)
+        return {
+            'statusCode': 202,
+            'body': {
+                'status': 'pending_approval',
+                'defer_token': decision.defer_token,
+                'message': decision.reason
+            }
+        }
+    
+    # PERMIT: execute Stripe refund
+    refund = stripe.Refund.create(
+        charge=event['charge_id'],
+        amount=int(event['amount'] * 100),
+        currency=event['currency']
+    )
+    
+    return {
+        'statusCode': 200,
+        'body': {
+            'refund_id': refund.id,
+            'amount': event['amount'],
+            'status': 'completed'
+        }
+    }
+```
+
+### Policy as Environment Variable
+
+Store the policy as a Base64-encoded or JSON-escaped string:
+
+```bash
+# Option 1: Base64 encoding
+POLICY_B64=$(cat policy.yaml | base64)
+aws lambda update-function-configuration \
+  --function-name my-function \
+  --environment "Variables={FARAMESH_POLICY_B64=$POLICY_B64}"
+```
+
+```python
+import os
+import base64
+
+policy_yaml = base64.b64decode(os.environ['FARAMESH_POLICY_B64']).decode('utf-8')
+guard = Guard(policy_yaml=policy_yaml)
+```
+
+## Google Cloud Functions
+
+```python main.py
+import os
+import functions_framework
+from faramesh.serverless import Guard
+
+guard = Guard(
+    policy_yaml=os.environ['FARAMESH_POLICY'],
+    agent_id='gcf-payment-bot'
+)
+
+@functions_framework.http
+def handle_refund(request):
+    data = request.get_json()
+    
+    decision = guard.govern(
+        request,
+        tool_id='stripe/refund',
+        args=data
+    )
+    
+    if decision.effect == 'DENY':
+        return {'error': decision.reason}, 403
+    
+    if decision.effect == 'DEFER':
+        return {
+            'status': 'pending',
+            'token': decision.defer_token
+        }, 202
+    
+    # Execute refund
+    result = process_refund(data['amount'], data['currency'])
+    return {'result': result}, 200
+```
+
+Deploy:
+
+```bash
+gcloud functions deploy handle-refund \
+  --runtime python311 \
+  --trigger-http \
+  --entry-point handle_refund \
+  --set-env-vars FARAMESH_POLICY="$(cat policy.yaml)"
+```
+
+## Google Cloud Run
+
+```dockerfile Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Policy file is baked into the image
+COPY policy.yaml /app/policy.yaml
+
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 main:app
+```
+
+```python main.py
+import os
+from flask import Flask, request, jsonify
+from faramesh.serverless import Guard
+
+app = Flask(__name__)
+
+# Initialize once at startup
+guard = Guard(
+    policy_path='/app/policy.yaml',
+    agent_id='cloudrun-bot'
+)
+
+@app.route('/refund', methods=['POST'])
+def handle_refund():
+    data = request.json
+    
+    decision = guard.govern(
+        request,
+        tool_id='stripe/refund',
+        args=data
+    )
+    
+    if decision.effect == 'DENY':
+        return jsonify({'error': decision.reason}), 403
+    
+    result = process_refund(data['amount'], data['currency'])
+    return jsonify({'result': result}), 200
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+```
+
+Deploy:
+
+```bash
+gcloud run deploy payment-service \
+  --source . \
+  --platform managed \
+  --region us-central1 \
+  --allow-unauthenticated
+```
+
+## Cold-Start Performance
+
+### Initialization Breakdown
+
+| Step | Latency | Notes |
+|------|---------|-------|
+| Import `faramesh.serverless` | ~10ms | Python module loading |
+| Parse policy YAML | ~5ms | YAML deserialization |
+| Compile expr-lang rules | ~20ms | 100 rules |
+| Open SQLite DPR store | ~10ms | `/tmp` is fast on Lambda |
+| **Total cold start** | **~50ms** | Cached across warm invocations |
+
+### Warm Invocation
+
+Once the Lambda is warm:
+
+- `guard.govern()` call: **&lt;5ms** (in-process evaluation)
+- No network hop, no daemon connection
+
+## DPR Storage in Serverless
+
+Serverless environments have ephemeral filesystems. DPR records are written to `/tmp`, which persists for the lifetime of the container:
+
+```python
+guard = Guard(
+    policy_yaml=os.environ['FARAMESH_POLICY'],
+    dpr_path='/tmp/faramesh-dpr.db'  # Lambda's writable /tmp
+)
+```
+
+<Warning>
+**Important**: DPR records in `/tmp` are lost when the Lambda container is recycled. For durable audit trails, enable **cloud sync** to Faramesh Cloud or export to S3/CloudWatch Logs.
+</Warning>
+
+### Export DPR to S3 (Example)
+
+```python
+import boto3
+import shutil
+
+s3 = boto3.client('s3')
+
+def export_dpr_on_exit():
+    """Called at the end of a batch or on container shutdown."""
+    shutil.copy('/tmp/faramesh-dpr.db', '/tmp/dpr-export.db')
+    s3.upload_file(
+        '/tmp/dpr-export.db',
+        'my-audit-bucket',
+        f'dpr/{os.environ["AWS_REQUEST_ID"]}.db'
+    )
+```
+
+## DEFER Workflow in Serverless
+
+DEFER is challenging in serverless because the function cannot block for minutes waiting for approval. Instead:
+
+1. **Return a pending response** with the `defer_token`
+2. The operator approves via CLI or API: `faramesh agent approve <token>`
+3. The client **retries** the request, which now evaluates to PERMIT
+
+### Example Flow
+
+<Steps>
+
+<Step title="Initial request triggers DEFER">
+```bash
+curl -X POST https://lambda-url/refund \
+  -d '{"amount": 50000, "currency": "usd"}'
+```
+
+Response:
+```json
+{
+  "status": "pending_approval",
+  "defer_token": "defer_7a8b9c0d",
+  "message": "Refund exceeds threshold — requires finance approval"
+}
+```
+</Step>
+
+<Step title="Operator approves">
+```bash
+faramesh agent approve defer_7a8b9c0d
+```
+</Step>
+
+<Step title="Client retries">
+```bash
+curl -X POST https://lambda-url/refund \
+  -d '{"amount": 50000, "currency": "usd"}'
+```
+
+Response:
+```json
+{
+  "status": "completed",
+  "refund_id": "re_abc123"
+}
+```
+</Step>
+
+</Steps>
+
+## Environment Variable Configuration
+
+All serverless adapters support env-based config:
+
+```bash
+export FARAMESH_POLICY="$(cat policy.yaml)"
+export FARAMESH_AGENT_ID="lambda-payment-bot"
+export AWS_REQUEST_ID="auto"  # Auto-detected by SDK
+```
+
+The SDK automatically extracts session IDs from:
+
+- **Lambda**: `AWS_REQUEST_ID`
+- **Cloud Functions**: `FUNCTION_EXECUTION_ID`
+- **Cloud Run**: `X-Cloud-Trace-Context` header
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Python SDK" icon="python" href="/integrations/python-sdk">
+    Full SDK reference
+  </Card>
+  <Card title="Daemon Mode" icon="server" href="/integrations/daemon-mode">
+    Long-lived daemon for multi-process scenarios
+  </Card>
+  <Card title="Policy Syntax" icon="file-code" href="/policy/syntax">
+    Write governance policies
+  </Card>
+  <Card title="Kubernetes" icon="dharmachakra" href="/integrations/kubernetes">
+    Deploy in K8s clusters
+  </Card>
+</CardGroup>

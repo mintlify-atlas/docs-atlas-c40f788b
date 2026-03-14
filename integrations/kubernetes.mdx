@@ -1,0 +1,618 @@
+---
+title: Kubernetes Deployment
+description: Deploy Faramesh in Kubernetes with Helm, sidecars, and NetworkPolicy
+---
+
+Faramesh integrates with Kubernetes via **Helm charts**, **sidecar injection**, and **NetworkPolicy** enforcement. The `faramesh init --auto-detect` command automatically generates K8s manifests when it detects a cluster environment.
+
+## Architecture
+
+Faramesh in Kubernetes can be deployed in multiple patterns:
+
+### Pattern 1: Sidecar per Pod
+
+```
+┌─────────────────────────────────────┐
+│ Pod: payment-agent                  │
+├─────────────────┬───────────────────┤
+│ Agent Container │ Faramesh Sidecar  │
+│                 │ (daemon mode)     │
+│ localhost:9090 ◄┼─────────────────► │
+└─────────────────┴───────────────────┘
+```
+
+The agent container connects to the Faramesh sidecar via `localhost:9090` (gRPC) or Unix socket (shared volume).
+
+### Pattern 2: Cluster-Wide Daemon
+
+```
+┌────────────┐    ┌────────────┐    ┌────────────┐
+│ Agent Pod 1│───►│            │◄───│ Agent Pod 2│
+└────────────┘    │ Faramesh   │    └────────────┘
+                  │ DaemonSet  │
+┌────────────┐    │ (shared)   │    ┌────────────┐
+│ Agent Pod 3│───►│            │◄───│ Agent Pod 4│
+└────────────┘    └────────────┘    └────────────┘
+```
+
+A single Faramesh daemon per node, shared by all pods on that node.
+
+## Quick Start with Helm
+
+### Install via Helm
+
+```bash
+# Add Faramesh Helm repository
+helm repo add faramesh https://charts.faramesh.dev
+helm repo update
+
+# Install in the current namespace
+helm install faramesh faramesh/faramesh \
+  --set policy.inline="$(cat policy.yaml)" \
+  --set mode=sidecar
+```
+
+### Install via `faramesh init`
+
+The CLI auto-detects Kubernetes and generates manifests:
+
+```bash
+# Auto-detect K8s and generate Helm values
+faramesh init --auto-detect
+```
+
+Output:
+```
+Detected environment: Kubernetes (namespace: default)
+Generating Helm values...
+
+helm install faramesh faramesh/faramesh -f faramesh-values.yaml
+```
+
+```yaml faramesh-values.yaml
+mode: sidecar
+policy:
+  configMap: faramesh-policy
+resources:
+  limits:
+    memory: 128Mi
+    cpu: 100m
+  requests:
+    memory: 64Mi
+    cpu: 50m
+```
+
+## Helm Chart Values
+
+### Sidecar Mode
+
+```yaml values.yaml
+mode: sidecar  # Inject Faramesh as a sidecar
+
+policy:
+  # Option 1: Inline policy YAML
+  inline: |
+    faramesh-version: '1.0'
+    agent-id: k8s-agent
+    default_effect: permit
+    rules:
+      - id: deny-shell
+        match:
+          tool: shell/run
+        effect: deny
+  
+  # Option 2: Reference an existing ConfigMap
+  configMap: faramesh-policy
+  configMapKey: policy.yaml
+
+image:
+  repository: ghcr.io/faramesh/faramesh
+  tag: latest
+  pullPolicy: IfNotPresent
+
+resources:
+  limits:
+    memory: 256Mi
+    cpu: 200m
+  requests:
+    memory: 128Mi
+    cpu: 100m
+
+# Service account for workload identity
+serviceAccount:
+  create: true
+  name: faramesh-sidecar
+  annotations:
+    iam.gke.io/gcp-service-account: faramesh@project.iam.gserviceaccount.com
+
+# Enable NetworkPolicy enforcement
+networkPolicy:
+  enabled: true
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+      - namespaceSelector:
+          matchLabels:
+            name: production
+      ports:
+      - protocol: TCP
+        port: 443
+```
+
+### DaemonSet Mode
+
+```yaml values-daemonset.yaml
+mode: daemonset  # One Faramesh daemon per node
+
+policy:
+  configMap: faramesh-policy
+
+# DaemonSet-specific settings
+daemonset:
+  hostPath: /var/run/faramesh  # Shared socket path on host
+  priorityClassName: system-node-critical
+
+resources:
+  limits:
+    memory: 512Mi
+    cpu: 500m
+```
+
+Deploy:
+
+```bash
+helm install faramesh faramesh/faramesh -f values-daemonset.yaml
+```
+
+## Sidecar Injection
+
+### Manual Injection
+
+Add the Faramesh sidecar to your Deployment:
+
+```yaml deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-agent
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: payment-agent
+  template:
+    metadata:
+      labels:
+        app: payment-agent
+    spec:
+      containers:
+      # Main agent container
+      - name: agent
+        image: my-org/payment-agent:latest
+        env:
+        - name: FARAMESH_SOCKET
+          value: "unix:///var/run/faramesh/faramesh.sock"
+        volumeMounts:
+        - name: faramesh-socket
+          mountPath: /var/run/faramesh
+      
+      # Faramesh sidecar
+      - name: faramesh
+        image: ghcr.io/faramesh/faramesh:latest
+        args:
+        - serve
+        - --policy
+        - /etc/faramesh/policy.yaml
+        - --socket
+        - /var/run/faramesh/faramesh.sock
+        volumeMounts:
+        - name: faramesh-policy
+          mountPath: /etc/faramesh
+          readOnly: true
+        - name: faramesh-socket
+          mountPath: /var/run/faramesh
+        resources:
+          limits:
+            memory: 128Mi
+            cpu: 100m
+      
+      volumes:
+      - name: faramesh-policy
+        configMap:
+          name: faramesh-policy
+      - name: faramesh-socket
+        emptyDir: {}
+```
+
+### Automatic Injection (Mutating Webhook)
+
+The Helm chart can install a mutating admission webhook for automatic sidecar injection:
+
+```yaml values.yaml
+webhook:
+  enabled: true
+  namespaceSelector:
+    matchLabels:
+      faramesh-injection: enabled
+```
+
+Label your namespace:
+
+```bash
+kubectl label namespace production faramesh-injection=enabled
+```
+
+All new pods in `production` namespace will automatically get the Faramesh sidecar.
+
+## Policy ConfigMap
+
+Store policies in a ConfigMap:
+
+```yaml policy-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: faramesh-policy
+  namespace: default
+data:
+  policy.yaml: |
+    faramesh-version: '1.0'
+    agent-id: k8s-payment-bot
+    default_effect: permit
+    
+    vars:
+      max_refund: 1000
+    
+    rules:
+      - id: defer-high-value-refund
+        match:
+          tool: stripe/refund
+          when: 'args["amount"] > vars["max_refund"]'
+        effect: defer
+        reason: refund exceeds threshold
+        reason_code: HIGH_VALUE_REFUND
+      
+      - id: deny-destructive-shell
+        match:
+          tool: shell/run
+          when: 'args["cmd"] matches "rm\\s+-[rf]"'
+        effect: deny
+        reason: destructive shell command
+        reason_code: DESTRUCTIVE_SHELL
+```
+
+Apply:
+
+```bash
+kubectl apply -f policy-configmap.yaml
+```
+
+## NetworkPolicy Integration
+
+Faramesh can enforce Kubernetes NetworkPolicy based on governance decisions:
+
+```yaml networkpolicy.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: faramesh-egress-control
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-agent
+  policyTypes:
+  - Egress
+  egress:
+  # Allow DNS
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+  
+  # Allow only governed HTTP egress
+  - to:
+    - podSelector:
+        matchLabels:
+          app: faramesh-proxy
+    ports:
+    - protocol: TCP
+      port: 8080
+```
+
+With this policy, all HTTP traffic from `payment-agent` pods must go through the Faramesh proxy, which enforces governance.
+
+## Namespace-Level Policies
+
+Deploy different policies per namespace:
+
+```bash
+# Production namespace: strict policy
+kubectl create namespace production
+kubectl apply -f production-policy.yaml -n production
+helm install faramesh-prod faramesh/faramesh \
+  -n production \
+  --set policy.configMap=production-policy
+
+# Staging namespace: permissive policy
+kubectl create namespace staging
+kubectl apply -f staging-policy.yaml -n staging
+helm install faramesh-staging faramesh/faramesh \
+  -n staging \
+  --set policy.configMap=staging-policy
+```
+
+## Service Mesh Integration
+
+### Istio
+
+Faramesh works alongside Istio for defense-in-depth:
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: payment-agent-sidecar
+  namespace: production
+spec:
+  workloadSelector:
+    labels:
+      app: payment-agent
+  egress:
+  - hosts:
+    - "production/*"
+    - "istio-system/*"
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: require-faramesh-governance
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: external-api
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        principals: ["cluster.local/ns/production/sa/faramesh-proxy"]
+```
+
+**Pattern**: Agent → Faramesh (governance) → Istio (mTLS, AuthZ) → External API
+
+### Linkerd
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: faramesh-proxy
+  namespace: production
+  annotations:
+    config.linkerd.io/skip-outbound-ports: "9090"  # Faramesh gRPC
+spec:
+  selector:
+    app: faramesh
+  ports:
+  - port: 9090
+    protocol: TCP
+```
+
+## Workload Identity
+
+Integrate with cloud provider workload identity:
+
+### GKE (Google Kubernetes Engine)
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: faramesh-sa
+  namespace: production
+  annotations:
+    iam.gke.io/gcp-service-account: faramesh@my-project.iam.gserviceaccount.com
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-agent
+spec:
+  template:
+    spec:
+      serviceAccountName: faramesh-sa
+      containers:
+      - name: faramesh
+        image: ghcr.io/faramesh/faramesh:latest
+        env:
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: /var/run/secrets/workload-identity/google-credentials.json
+```
+
+### EKS (Amazon Elastic Kubernetes Service)
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: faramesh-sa
+  namespace: production
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/FarameshRole
+```
+
+## Monitoring and Observability
+
+### Prometheus Integration
+
+The Helm chart exposes Prometheus metrics:
+
+```yaml values.yaml
+metrics:
+  enabled: true
+  port: 9091
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+```
+
+Prometheus ServiceMonitor:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: faramesh
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: faramesh
+  endpoints:
+  - port: metrics
+    interval: 30s
+```
+
+Key metrics:
+
+- `faramesh_decisions_total{effect="PERMIT|DENY|DEFER"}` — Decision counts
+- `faramesh_latency_seconds` — Governance latency
+- `faramesh_active_sessions` — Active agent sessions
+
+### Grafana Dashboard
+
+Import the official Faramesh dashboard:
+
+```bash
+kubectl apply -f https://charts.faramesh.dev/grafana-dashboard.json
+```
+
+### OpenTelemetry
+
+Export traces to an OTEL collector:
+
+```yaml values.yaml
+telemetry:
+  enabled: true
+  otel:
+    endpoint: otel-collector.observability.svc.cluster.local:4317
+    samplingRate: 0.1
+```
+
+## Auto-Scaling
+
+### Horizontal Pod Autoscaler (HPA)
+
+```yaml hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: faramesh-hpa
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: faramesh-daemon
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Pods
+    pods:
+      metric:
+        name: faramesh_decisions_per_second
+      target:
+        type: AverageValue
+        averageValue: "1000"
+```
+
+## Production Checklist
+
+<Steps>
+
+<Step title="Policy Validation">
+```bash
+faramesh policy validate production-policy.yaml
+```
+</Step>
+
+<Step title="Resource Limits">
+Set appropriate CPU and memory limits:
+```yaml
+resources:
+  limits:
+    memory: 256Mi
+    cpu: 200m
+  requests:
+    memory: 128Mi
+    cpu: 100m
+```
+</Step>
+
+<Step title="High Availability">
+Run at least 2 replicas:
+```yaml
+replicaCount: 2
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        labelSelector:
+          matchLabels:
+            app: faramesh
+        topologyKey: kubernetes.io/hostname
+```
+</Step>
+
+<Step title="Persistent Audit Logs">
+Use a PersistentVolume for DPR storage:
+```yaml
+persistence:
+  enabled: true
+  storageClass: fast-ssd
+  size: 10Gi
+```
+</Step>
+
+<Step title="Security Context">
+```yaml
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+  capabilities:
+    drop:
+    - ALL
+```
+</Step>
+
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Python SDK" icon="python" href="/integrations/python-sdk">
+    Connect K8s agents to Faramesh
+  </Card>
+  <Card title="Policy Syntax" icon="file-code" href="/policy/syntax">
+    Write governance policies
+  </Card>
+  <Card title="Daemon Mode" icon="server" href="/integrations/daemon-mode">
+    Understand daemon architecture
+  </Card>
+  <Card title="Serverless" icon="bolt" href="/integrations/serverless">
+    Compare with serverless deployment
+  </Card>
+</CardGroup>

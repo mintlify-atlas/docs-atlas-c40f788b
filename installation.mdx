@@ -1,0 +1,330 @@
+---
+title: Installation
+description: Install Faramesh via Homebrew, install script, Docker, Go toolchain, or Python SDK
+---
+
+Choose the installation method that best fits your environment.
+
+## Homebrew (macOS / Linux)
+
+The recommended installation method for macOS and Linux users:
+
+```bash
+brew install faramesh/tap/faramesh
+```
+
+Verify the installation:
+
+```bash
+faramesh --version
+```
+
+<Note>
+  Homebrew automatically adds the binary to your PATH and keeps it up to date with `brew upgrade`.
+</Note>
+
+## Install Script (macOS / Linux)
+
+Use the official install script for a quick one-line installation:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/faramesh/faramesh-core/main/install.sh | sh
+```
+
+### What the Install Script Does
+
+<Steps>
+  <Step title="Detects your platform">
+    Automatically detects OS (Linux/Darwin) and architecture (amd64/arm64)
+  </Step>
+  <Step title="Downloads the latest release">
+    Fetches the appropriate binary from GitHub releases
+  </Step>
+  <Step title="Verifies SHA256 checksum">
+    Validates the binary integrity using the published checksum
+  </Step>
+  <Step title="Installs to a standard location">
+    Tries `/usr/local/bin`, `/usr/bin`, or `~/.local/bin` in order of preference
+  </Step>
+  <Step title="Configures PATH if needed">
+    Warns you if the install directory is not on your PATH
+  </Step>
+</Steps>
+
+### Manual Installation from Script
+
+If you want more control, download and inspect the script first:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/faramesh/faramesh-core/main/install.sh -o install.sh
+chmod +x install.sh
+./install.sh
+```
+
+<Info>
+  The install script supports both `curl` and `wget`, and uses `sha256sum` (Linux) or `shasum` (macOS) for verification.
+</Info>
+
+## Docker
+
+Run Faramesh in a container without installing it locally:
+
+### Quick Demo
+
+```bash
+docker run --rm ghcr.io/faramesh/faramesh:latest demo
+```
+
+### Interactive CLI
+
+```bash
+docker run --rm -it ghcr.io/faramesh/faramesh:latest --help
+```
+
+### Run the Daemon
+
+To run the Faramesh daemon as a service:
+
+```bash docker-compose.yml
+version: '3.8'
+services:
+  faramesh:
+    image: ghcr.io/faramesh/faramesh:latest
+    command: serve --policy /config/policy.yaml
+    volumes:
+      - ./policy.yaml:/config/policy.yaml:ro
+      - faramesh-data:/data
+    environment:
+      - FARAMESH_DATA_DIR=/data
+    ports:
+      - "8080:8080"
+
+volumes:
+  faramesh-data:
+```
+
+Start the service:
+
+```bash
+docker-compose up -d
+```
+
+<Warning>
+  When running in Docker, mount your policy file as a volume and ensure the DPR database is persisted to a named volume.
+</Warning>
+
+## Go Toolchain (Build from Source)
+
+If you have Go 1.21 or later installed, you can compile from source:
+
+```bash
+go install github.com/faramesh/faramesh-core/cmd/faramesh@latest
+```
+
+<Info>
+  This takes approximately 5 minutes due to embedded SQLite compilation. The binary will be installed to `$GOPATH/bin` (typically `~/go/bin`).
+</Info>
+
+Verify `$GOPATH/bin` is on your PATH:
+
+```bash
+which faramesh
+# Should output: /home/user/go/bin/faramesh (or similar)
+```
+
+If not found, add to your shell profile:
+
+<CodeGroup>
+```bash ~/.bashrc
+export PATH="$PATH:$(go env GOPATH)/bin"
+```
+
+```bash ~/.zshrc
+export PATH="$PATH:$(go env GOPATH)/bin"
+```
+</CodeGroup>
+
+## Python SDK
+
+For Python-based agents, install the Faramesh SDK:
+
+```bash
+pip install faramesh
+```
+
+The Python SDK includes:
+- `govern()` decorator for wrapping functions
+- `FarameshClient` for direct API access
+- Exception types: `DenyError`, `DeferredError`, `FarameshError`
+- Automatic daemon management in development mode
+
+### Verify Installation
+
+```python
+import faramesh
+print(faramesh.__version__)
+# Output: 1.0.0
+```
+
+### SDK with Binary
+
+For production deployments, install both the Python SDK and the Faramesh binary:
+
+```bash
+# Install the binary (choose one method above)
+brew install faramesh/tap/faramesh
+
+# Install the Python SDK
+pip install faramesh
+```
+
+<Tip>
+  The Python SDK auto-starts the Faramesh daemon on first call in development mode. For production, run the daemon explicitly with `faramesh serve`.
+</Tip>
+
+## Windows
+
+Faramesh on Windows is supported via direct download:
+
+<Steps>
+  <Step title="Download the Windows binary">
+    Go to the [latest release](https://github.com/faramesh/faramesh-core/releases/latest) on GitHub.
+  </Step>
+  <Step title="Download faramesh-windows-amd64.exe">
+    Download the Windows executable for your architecture.
+  </Step>
+  <Step title="Rename the binary">
+    Rename `faramesh-windows-amd64.exe` to `faramesh.exe`.
+  </Step>
+  <Step title="Add to PATH">
+    Move the binary to a directory on your PATH, such as `C:\Program Files\Faramesh\`, and add that directory to your system PATH.
+  </Step>
+  <Step title="Verify installation">
+    Open a new Command Prompt or PowerShell window:
+    ```powershell
+    faramesh --version
+    ```
+  </Step>
+</Steps>
+
+### Windows Subsystem for Linux (WSL)
+
+Alternatively, use WSL and follow the Linux installation instructions:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/faramesh/faramesh-core/main/install.sh | sh
+```
+
+## Platform-Specific Notes
+
+### macOS
+
+<Tabs>
+  <Tab title="Intel (x86_64)">
+    ```bash
+    brew install faramesh/tap/faramesh
+    ```
+    The Homebrew formula automatically detects Intel architecture.
+  </Tab>
+  <Tab title="Apple Silicon (arm64)">
+    ```bash
+    brew install faramesh/tap/faramesh
+    ```
+    Native arm64 binaries are available and automatically selected.
+  </Tab>
+</Tabs>
+
+### Linux
+
+Supported distributions:
+- Ubuntu 20.04+
+- Debian 11+
+- CentOS/RHEL 8+
+- Arch Linux
+- Alpine Linux 3.16+
+
+<CodeGroup>
+```bash Ubuntu / Debian
+curl -fsSL https://raw.githubusercontent.com/faramesh/faramesh-core/main/install.sh | sh
+```
+
+```bash Alpine
+apk add curl bash
+curl -fsSL https://raw.githubusercontent.com/faramesh/faramesh-core/main/install.sh | sh
+```
+
+```bash Arch
+yay -S faramesh-bin
+# Or use the install script
+```
+</CodeGroup>
+
+## Verify Installation
+
+After installation, verify Faramesh is working:
+
+```bash
+faramesh --version
+```
+
+```
+faramesh version 1.2.0
+```
+
+Run the built-in demo:
+
+```bash
+faramesh demo
+```
+
+You should see governance decisions being evaluated in real-time.
+
+## Uninstall
+
+<Tabs>
+  <Tab title="Homebrew">
+    ```bash
+    brew uninstall faramesh
+    ```
+  </Tab>
+  <Tab title="Install Script">
+    ```bash
+    # Find where it was installed
+    which faramesh
+    # Output: /usr/local/bin/faramesh
+
+    # Remove the binary
+    sudo rm /usr/local/bin/faramesh
+
+    # Remove data directory (optional)
+    rm -rf ~/.faramesh
+    ```
+  </Tab>
+  <Tab title="Go Install">
+    ```bash
+    rm $(which faramesh)
+    ```
+  </Tab>
+  <Tab title="Python SDK">
+    ```bash
+    pip uninstall faramesh
+    ```
+  </Tab>
+</Tabs>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build your first governed function in 5 minutes
+  </Card>
+  <Card title="CLI Reference" icon="terminal" href="/cli/demo">
+    Learn all available Faramesh CLI commands
+  </Card>
+  <Card title="Python SDK" icon="python" href="/integrations/python-sdk">
+    Complete Python SDK documentation and examples
+  </Card>
+  <Card title="Configuration" icon="gear" href="/installation">
+    Configure Faramesh for your environment
+  </Card>
+</CardGroup>

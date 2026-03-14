@@ -1,0 +1,459 @@
+---
+title: Observability
+description: Production-grade telemetry with OpenTelemetry, PIE analytics, and cross-session flow tracking
+---
+
+Faramesh provides comprehensive observability for governance decisions, policy impact, and multi-agent coordination.
+
+---
+
+## Architecture
+
+Faramesh observability operates across multiple layers:
+
+- **Structured logging** — PII-aware log schema with field classification
+- **Prometheus metrics** — Decision counters, latency histograms, incident prevention
+- **OpenTelemetry traces** — Full pipeline instrumentation with cross-agent propagation
+- **PIE analytics** — Policy Intelligence Engine for dead rule detection and drift analysis
+- **Cross-session tracking** — Information flow analysis across sessions
+- **Decision provenance** — Argument origin tracking (user input vs. tool output)
+
+<Info>
+All observability features are available in the open-source distribution. Cloud adds fleet-wide dashboards and anomaly detection.
+</Info>
+
+---
+
+## Structured Logging
+
+Faramesh uses a **mandatory field classification schema** to prevent PII leaks in logs.
+
+### Log Schema
+
+```go
+type FieldClass int
+
+const (
+    FieldPublic      // Safe for any log destination
+    FieldInternal    // Internal use only
+    FieldSensitive   // Requires access control
+    FieldPII         // Auto-redacted
+    FieldSecret      // Never logged
+)
+```
+
+### Field Classification
+
+**Public fields:**
+- `timestamp`, `level`, `effect`, `reason_code`
+- `tool_id`, `agent_id`, `session_id`, `dpr_record_id`
+- `policy_version`, `latency_us`
+
+**PII fields (auto-redacted):**
+- `principal_email`, `principal_name`
+- `args`, `message_history`
+
+**Secret fields (never logged):**
+- `credential_value`, `api_key`, `session_token`
+
+### Example Log Entry
+
+```json
+{
+  "timestamp": "2026-03-14T10:15:30Z",
+  "level": "info",
+  "effect": "DENY",
+  "reason_code": "HIGH_VALUE_REFUND",
+  "tool_id": "stripe/refund",
+  "agent_id": "payment-bot",
+  "session_id": "sess_abc123",
+  "dpr_record_id": "dpr_xyz789",
+  "latency_us": 1250,
+  "args": "[REDACTED]"
+}
+```
+
+### Sanitization
+
+```go
+// Internal logs (may contain sensitive data)
+entry := LogEntry{
+    Level: "info",
+    Fields: map[string]string{
+        "principal_email": "user@company.com",
+        "args": `{"amount": 1000}`,
+    },
+}
+
+// External export (sanitized)
+sanitized := entry.SanitizeForExternalExport()
+// principal_email → [REDACTED]
+// args → [REDACTED]
+```
+
+---
+
+## Prometheus Metrics
+
+Faramesh exposes Prometheus-compatible metrics at `/metrics`.
+
+### Decision Metrics
+
+```
+# Decision counters by effect
+faramesh_decisions_total{effect="permit"} 1247
+faramesh_decisions_total{effect="deny"} 32
+faramesh_decisions_total{effect="defer"} 15
+faramesh_decisions_total{effect="shadow"} 0
+
+# Deny reasons
+faramesh_deny_reasons_total{reason_code="HIGH_VALUE_REFUND"} 18
+faramesh_deny_reasons_total{reason_code="DESTRUCTIVE_SHELL"} 14
+
+# Latency histogram
+faramesh_decision_latency_seconds_bucket{le="0.001"} 1205
+faramesh_decision_latency_seconds_bucket{le="0.005"} 1290
+faramesh_decision_latency_seconds_bucket{le="0.01"} 1294
+faramesh_decision_latency_seconds_sum 1.847
+faramesh_decision_latency_seconds_count 1294
+```
+
+### WAL Metrics
+
+```
+faramesh_wal_writes_total{status="success"} 1294
+faramesh_wal_writes_total{status="error"} 0
+```
+
+### Incident Prevention
+
+```
+faramesh_incidents_prevented_total{category_severity="destructive:critical"} 14
+faramesh_incidents_prevented_total{category_severity="exfil:high"} 8
+faramesh_incidents_prevented_per_1k_calls 17.0
+```
+
+### Exporting to Prometheus
+
+**Kubernetes (ServiceMonitor):**
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: faramesh
+spec:
+  selector:
+    matchLabels:
+      app: faramesh
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+```
+
+**Docker Compose:**
+
+```yaml
+services:
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    
+prometheus.yml:
+  scrape_configs:
+    - job_name: faramesh
+      static_configs:
+        - targets: ['faramesh:9090']
+```
+
+---
+
+## OpenTelemetry Integration
+
+Faramesh emits OTel-compatible traces for the full governance pipeline.
+
+### Trace Spans
+
+**Governance pipeline:**
+
+```
+faramesh.govern (SPAN_KIND_SERVER)
+  │
+  ├─ faramesh.policy_eval (SPAN_KIND_INTERNAL)
+  │  ├─ attributes:
+  │  │  ├─ faramesh.rule_count: 12
+  │  │  └─ faramesh.matched_rule: defer-high-value-refund
+  │  └─ duration: 850μs
+  │
+  ├─ faramesh.dpr_write (SPAN_KIND_CLIENT)
+  │  └─ attributes:
+  │     └─ faramesh.dpr_record_id: dpr_abc123
+  │
+  └─ faramesh.defer (SPAN_KIND_INTERNAL)
+     └─ attributes:
+        └─ faramesh.defer_token: defer_xyz789
+```
+
+### Configuration
+
+```yaml
+observability:
+  otel:
+    enabled: true
+    service_name: faramesh
+    exporter: otlp
+    endpoint: http://jaeger:4317
+    
+    # Sampling
+    sampler: always_on  # or "trace_id_ratio" with ratio: 0.1
+```
+
+### Trace Propagation
+
+Traces propagate across agent invocations:
+
+```
+Orchestrator (trace_id: abc123)
+  ├─ span: orchestrator.invoke
+  │
+  └─ Agent A (trace_id: abc123, parent: orchestrator.invoke)
+     ├─ span: agent_a.govern
+     │
+     └─ Agent B (trace_id: abc123, parent: agent_a.govern)
+        └─ span: agent_b.govern
+```
+
+### Exporters
+
+**OTLP (Jaeger, Grafana Tempo):**
+
+```yaml
+observability:
+  otel:
+    exporter: otlp
+    endpoint: http://tempo:4317
+```
+
+**Stdout (development):**
+
+```yaml
+observability:
+  otel:
+    exporter: stdout
+```
+
+---
+
+## Policy Intelligence Engine (PIE)
+
+PIE analyzes governance decisions over time to surface policy optimization opportunities.
+
+### Dead Rule Detection
+
+Rules that haven't triggered in 30 days:
+
+```bash
+faramesh pie dead-rules --inactive 30d
+```
+
+**Output:**
+
+```
+Dead Rules (inactive > 30 days)
+  • restrict-weekend-deploys (last triggered: 45 days ago)
+  • deny-prod-db-read (last triggered: 60 days ago)
+```
+
+### High Approval Rate Analysis
+
+DEFER rules with >90% approval rate (candidates for PERMIT):
+
+```bash
+faramesh pie high-approval --threshold 0.9
+```
+
+**Output:**
+
+```
+High Approval Rate Rules
+  • defer-customer-refund (approval rate: 94%, defers: 150)
+    → Recommendation: promote to PERMIT with lower threshold
+```
+
+### Policy Drift Detection
+
+Rules whose behavior changed significantly:
+
+```bash
+faramesh pie drift
+```
+
+**Output:**
+
+```
+Policy Drift Detected
+  • allow-staging-deploy
+    → Nearly always permits (99.2%)
+    → May be redundant or misconfigured
+  
+  • restrict-prod-write
+    → Nearly always denies (97.1%)
+    → May be too broad
+```
+
+---
+
+## Cross-Session Analytics
+
+Faramesh tracks information flow across sessions to detect exfiltration patterns.
+
+### Flow Tracking
+
+```go
+ft := observe.NewFlowTracker()
+
+// Configure what counts as "read" vs "exfil"
+ft.SetReadTools([]string{"db/query", "fs/read"})
+ft.SetExfilTools([]string{"email/send", "api/post"})
+
+// Record access
+ft.RecordAccess(observe.FlowRecord{
+    PrincipalID: "user@company.com",
+    SessionID:   "sess_001",
+    ToolID:      "db/query",
+    Effect:      "PERMIT",
+    DPRID:       "dpr_abc",
+})
+```
+
+### Exfil Pattern Detection
+
+```go
+// Detect read-then-exfil within 1 hour
+patterns := ft.DetectExfilPatterns(1 * time.Hour)
+
+for _, p := range patterns {
+    fmt.Printf("Exfil pattern: %s\n", p.PrincipalID)
+    fmt.Printf("  Read session: %s (tool: %s)\n", 
+        p.ReadSession, p.ReadTool)
+    fmt.Printf("  Exfil session: %s (tool: %s)\n", 
+        p.ExfilSession, p.ExfilTool)
+    fmt.Printf("  Time between: %v\n", p.TimeBetween)
+}
+```
+
+**Output:**
+
+```
+Exfil pattern: user@company.com
+  Read session: sess_001 (tool: db/query)
+  Exfil session: sess_002 (tool: email/send)
+  Time between: 15m
+```
+
+---
+
+## Decision Provenance
+
+Faramesh tracks the **origin of each argument** to enable provenance-based policies.
+
+### Provenance Sources
+
+```go
+type ProvenanceSource string
+
+const (
+    ProvenanceUserInput    // Came from user message
+    ProvenanceToolOutput   // Output of a prior tool
+    ProvenanceSessionState // From session state
+    ProvenanceHardcoded    // Hardcoded in agent code
+    ProvenanceDerived      // Computed/transformed
+    ProvenanceUnknown      // Cannot determine
+)
+```
+
+### Provenance Tracking
+
+```go
+pt := observe.NewProvenanceTracker()
+
+// Record tool output
+pt.RecordToolOutput(dprID, "stripe/charge", map[string]any{
+    "charge_id": "ch_abc123",
+})
+
+// Later: infer provenance of arguments
+env := pt.InferProvenance("stripe/refund", map[string]any{
+    "charge_id": "ch_abc123",
+}, sessionState)
+
+for _, entry := range env.Entries {
+    fmt.Printf("%s: %s\n", entry.ArgPath, entry.Source)
+}
+```
+
+**Output:**
+
+```
+charge_id: tool_output (from dpr_xyz)
+```
+
+### Policy Integration
+
+```yaml
+rules:
+  - id: deny-user-controlled-recipient
+    match:
+      tool: email/send
+      when: 'args["recipient"].provenance == "user_input"'
+    effect: deny
+    reason: user cannot directly control email recipient
+```
+
+---
+
+## Fleet-Wide Observability (Cloud)
+
+Faramesh Cloud provides centralized observability across your agent fleet.
+
+### Features
+
+- **Unified dashboard** — All agents, all decisions, one view
+- **Anomaly detection** — Detect unusual patterns (cost spikes, new deny reasons)
+- **Cost analytics** — Per-agent, per-tool cost tracking
+- **Compliance exports** — SOC 2, HIPAA, EU AI Act reports
+
+**Setup:**
+
+```bash
+faramesh auth login
+faramesh cloud enable-observability
+```
+
+---
+
+## Best Practices
+
+<Info>
+**Use PIE analytics weekly** — Detect dead rules and high-approval DEFER candidates.
+</Info>
+
+1. **Enable OTel in production** — Full pipeline visibility
+2. **Export metrics to Prometheus** — Dashboards in Grafana
+3. **Monitor cross-session flows** — Detect exfil patterns
+4. **Review deny reasons monthly** — Identify policy gaps
+5. **Track incidents prevented** — Prove governance value
+
+<Warning>
+**Sanitize logs before external export** — Use `SanitizeForExternalExport()` to redact PII and secrets.
+</Warning>
+
+---
+
+## Related Docs
+
+- [Policy Configuration](/policy/overview) — Write observable policy rules
+- [Multi-Agent Governance](/advanced/multi-agent) — Cross-agent coordination
+- [Security](/advanced/security) — Security event monitoring

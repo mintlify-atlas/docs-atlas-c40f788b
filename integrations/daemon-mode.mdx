@@ -1,0 +1,395 @@
+---
+title: Daemon Mode
+description: Run Faramesh as a persistent governance service
+---
+
+Daemon mode runs Faramesh as a **long-lived background process** that accepts governance requests from multiple agent processes via Unix domain sockets or gRPC. This is the **A2 Local Daemon** adapter — ideal for multi-process scenarios, production deployments, and shared governance across teams.
+
+## Architecture
+
+```
+Agent Process 1 ──┐
+                  │
+Agent Process 2 ──┼──► Unix Socket ──► Faramesh Daemon ──► Pipeline ──► Decision
+                  │    /tmp/faramesh.sock
+Agent Process 3 ──┘
+```
+
+All agent processes connect to a single daemon via `/tmp/faramesh.sock`. The daemon:
+
+- Loads and compiles the policy once at startup
+- Maintains the DPR (Decision-Provenance Record) chain
+- Handles DEFER workflow (parking requests until approval)
+- Provides health checks and metrics
+- Supports multi-tenant session isolation
+
+## Starting the Daemon
+
+### Basic Usage
+
+```bash
+faramesh serve --policy policy.yaml
+```
+
+The daemon:
+1. Loads and compiles `policy.yaml`
+2. Opens the SQLite DPR store at `~/.faramesh/faramesh.db`
+3. Creates a Unix socket at `/tmp/faramesh.sock`
+4. Starts accepting governance requests
+
+### Configuration Options
+
+```bash
+faramesh serve \
+  --policy payment.yaml \
+  --socket /var/run/faramesh.sock \
+  --data-dir /var/lib/faramesh \
+  --log-level info \
+  --port 9090  # Optional: gRPC port for remote clients
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--policy` | `policy.yaml` | Path to policy YAML file |
+| `--socket` | `/tmp/faramesh.sock` | Unix socket path |
+| `--data-dir` | `~/.faramesh` | Directory for DPR database and WAL |
+| `--log-level` | `info` | Log verbosity: `debug`, `info`, `warn`, `error` |
+| `--port` | (none) | Expose gRPC on TCP port (for remote agents) |
+| `--health-port` | `8080` | HTTP health check endpoint |
+
+## Unix Socket Communication
+
+The daemon uses **newline-delimited JSON** over a Unix domain socket:
+
+### Request Format
+
+```json
+{
+  "type": "govern",
+  "call_id": "550e8400-e29b-41d4-a716-446655440000",
+  "agent_id": "payment-bot",
+  "session_id": "session-123",
+  "tool_id": "stripe/refund",
+  "args": {
+    "amount": 100,
+    "currency": "usd"
+  }
+}
+```
+
+### Response Format
+
+```json
+{
+  "effect": "PERMIT",
+  "rule_id": "allow-small-refunds",
+  "reason": "refund within auto-approval threshold",
+  "reason_code": "AUTO_APPROVED",
+  "policy_version": "sha256:a1b2c3d4",
+  "latency_ms": 12
+}
+```
+
+For `DEFER` responses:
+
+```json
+{
+  "effect": "DEFER",
+  "defer_token": "defer_7a8b9c0d",
+  "reason": "refund exceeds threshold — requires finance approval",
+  "reason_code": "HIGH_VALUE_REFUND"
+}
+```
+
+## Policy Loading
+
+The daemon loads the policy file at startup. Changes to the policy file require a restart:
+
+```bash
+# Validate policy changes before restarting
+faramesh policy validate payment.yaml
+
+# Restart daemon (via systemd, supervisord, or manual kill/start)
+sudo systemctl restart faramesh
+```
+
+<Note>
+**Hot reload** is planned for a future release. For now, use blue/green deployments or rolling restarts for zero-downtime policy updates.
+</Note>
+
+## Multi-Process Support
+
+Multiple agent processes can connect to the same daemon:
+
+```python
+# Process 1: Finance bot
+from faramesh import govern
+refund = govern(stripe_refund, policy='payment.yaml', agent_id='finance-bot', auto_start=False)
+
+# Process 2: Support bot
+from faramesh import govern
+refund = govern(stripe_refund, policy='payment.yaml', agent_id='support-bot', auto_start=False)
+
+# Both connect to /tmp/faramesh.sock
+# Each has separate session state, budgets, and audit trails
+```
+
+### Session Isolation
+
+Each `agent_id` + `session_id` pair gets:
+
+- Independent rate limits
+- Separate budget counters
+- Isolated history ring buffers
+- Distinct audit trail entries
+
+## Health Checks
+
+The daemon exposes a health check endpoint:
+
+```bash
+curl http://localhost:8080/health
+```
+
+Response:
+
+```json
+{
+  "status": "healthy",
+  "version": "1.0.0",
+  "uptime_seconds": 3600,
+  "active_clients": 5,
+  "policy_version": "sha256:a1b2c3d4",
+  "dpr_records": 1247
+}
+```
+
+### Readiness Check
+
+```bash
+curl http://localhost:8080/ready
+```
+
+Returns `200 OK` when:
+- Policy is loaded and compiled
+- DPR store is initialized
+- Unix socket is accepting connections
+
+## Service Discovery
+
+The daemon supports **mDNS (multicast DNS)** for automatic discovery in local networks:
+
+```bash
+faramesh serve --policy policy.yaml --mdns
+```
+
+Clients can discover the daemon:
+
+```python
+from faramesh.client import discover_daemon
+
+socket_path = discover_daemon(timeout=5.0)
+client = FarameshClient(socket_path=socket_path)
+```
+
+## Systemd Integration
+
+Run the daemon as a systemd service:
+
+```ini /etc/systemd/system/faramesh.service
+[Unit]
+Description=Faramesh Governance Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=faramesh
+Group=faramesh
+ExecStart=/usr/local/bin/faramesh serve \
+  --policy /etc/faramesh/policy.yaml \
+  --socket /var/run/faramesh.sock \
+  --data-dir /var/lib/faramesh
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/faramesh /var/run
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl enable faramesh
+sudo systemctl start faramesh
+sudo systemctl status faramesh
+```
+
+## Docker Deployment
+
+```dockerfile Dockerfile
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN go build -o faramesh ./cmd/faramesh
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+COPY --from=builder /app/faramesh /usr/local/bin/faramesh
+COPY policy.yaml /etc/faramesh/policy.yaml
+
+# Create data directory
+RUN mkdir -p /var/lib/faramesh
+
+EXPOSE 8080 9090
+CMD ["faramesh", "serve", \
+     "--policy", "/etc/faramesh/policy.yaml", \
+     "--socket", "/var/run/faramesh.sock", \
+     "--data-dir", "/var/lib/faramesh", \
+     "--port", "9090", \
+     "--health-port", "8080"]
+```
+
+Run with Docker:
+
+```bash
+docker build -t faramesh-daemon .
+docker run -d \
+  --name faramesh \
+  -v $(pwd)/policy.yaml:/etc/faramesh/policy.yaml \
+  -v faramesh-data:/var/lib/faramesh \
+  -p 8080:8080 \
+  -p 9090:9090 \
+  faramesh-daemon
+```
+
+## gRPC Mode
+
+For remote agents (different machines or containers), expose gRPC:
+
+```bash
+faramesh serve --policy policy.yaml --port 9090
+```
+
+Clients connect via gRPC instead of Unix socket:
+
+```python
+from faramesh.client import FarameshClient
+
+client = FarameshClient(grpc_address='daemon.example.com:9090')
+decision = client.govern(
+    agent_id='remote-agent',
+    session_id='session-123',
+    tool_id='stripe/refund',
+    args={'amount': 100, 'currency': 'usd'}
+)
+```
+
+<Warning>
+gRPC mode exposes the governance daemon to the network. Use mTLS or a service mesh for authentication and encryption in production.
+</Warning>
+
+## Monitoring
+
+### Audit Log Streaming
+
+```bash
+faramesh audit tail --follow
+```
+
+Output:
+```
+[10:15:32] PERMIT  stripe_refund      agent=finance-bot  latency=8ms
+[10:15:45] DEFER   stripe_refund      agent=support-bot  token=defer_7a8b9c0d
+[10:16:02] DENY    run_shell          agent=infra-bot    rule=deny-destructive-shell
+```
+
+### Metrics Export
+
+The daemon exposes Prometheus metrics at `/metrics`:
+
+```bash
+curl http://localhost:8080/metrics
+```
+
+Key metrics:
+
+- `faramesh_decisions_total{effect="PERMIT|DENY|DEFER"}` — Decision counts
+- `faramesh_latency_seconds` — Governance latency histogram
+- `faramesh_active_sessions` — Number of active sessions
+- `faramesh_dpr_records_total` — Total DPR records written
+
+## Logging
+
+Structured JSON logs:
+
+```bash
+faramesh serve --policy policy.yaml --log-level debug --log-format json
+```
+
+Example log entry:
+
+```json
+{
+  "level": "info",
+  "ts": "2026-03-14T10:15:32Z",
+  "msg": "governance decision",
+  "agent_id": "payment-bot",
+  "tool_id": "stripe/refund",
+  "effect": "PERMIT",
+  "latency_ms": 12,
+  "rule_id": "allow-small-refunds"
+}
+```
+
+## Performance
+
+### Cold Start
+
+Daemon startup time:
+
+- Policy compilation: ~50ms (100 rules)
+- SQLite initialization: ~20ms
+- Socket binding: &lt;5ms
+
+**Total cold start: &lt;100ms**
+
+### Hot Path
+
+Per-request latency:
+
+- Policy evaluation: ~1μs per rule (expr-lang bytecode)
+- Session state read: ~100ns (sync.Map)
+- WAL write: ~500μs (fsync to disk)
+- Total: **&lt;5ms** for typical policies (10-50 rules)
+
+### Throughput
+
+Single daemon instance:
+
+- **10,000+ requests/sec** (PERMIT decisions, no WAL)
+- **5,000+ requests/sec** (with WAL fsync)
+- **1,000+ requests/sec** (with DPR SQLite writes)
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Python SDK" icon="python" href="/integrations/python-sdk">
+    Connect agents to the daemon
+  </Card>
+  <Card title="Kubernetes" icon="dharmachakra" href="/integrations/kubernetes">
+    Deploy as a sidecar in K8s
+  </Card>
+  <Card title="Serverless" icon="bolt" href="/integrations/serverless">
+    In-process mode for Lambda
+  </Card>
+  <Card title="Policy Syntax" icon="file-code" href="/policy/syntax">
+    Write governance policies
+  </Card>
+</CardGroup>

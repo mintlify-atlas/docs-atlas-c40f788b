@@ -1,0 +1,313 @@
+---
+title: 'Policy Engine'
+description: 'How policy evaluation works: first-match-wins rule evaluation with expr-lang'
+---
+
+## Overview
+
+The Faramesh policy engine evaluates every tool call against a YAML policy file. Rules are evaluated in document order using **first-match-wins** semantics. Conditions are written in [expr-lang](https://github.com/expr-lang/expr), a Go-native, type-safe expression language.
+
+<Info>
+Policy rules compile to bytecode at load time and evaluate at **~1μs per rule**. Governance adds negligible latency to agent operations.
+</Info>
+
+## Policy Schema
+
+Every policy file follows the Faramesh Policy Language (FPL) v1.0 schema:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: payment-bot
+default_effect: permit
+
+vars:
+  max_refund: 500
+  max_email_recipients: 50
+
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    tags: [financial]
+  shell/run:
+    reversibility: irreversible
+    blast_radius: local
+    tags: [system]
+
+rules:
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]"'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold — requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+```
+
+See the full schema in `internal/core/policy/schema.go`.
+
+## Rule Evaluation: First-Match-Wins
+
+Rules are evaluated **in document order**. The first rule whose `match` conditions are satisfied determines the effect:
+
+```go internal/core/policy/engine.go:126
+// Evaluate runs the first-match-wins evaluation pipeline.
+// If no rule matches, the policy's default_effect is applied.
+func (e *Engine) Evaluate(toolID string, ctx EvalContext) EvalResult {
+    for i, rule := range e.doc.Rules {
+        if !matchTool(rule.Match.Tool, toolID) {
+            continue
+        }
+        if e.programs[i] != nil {
+            // Evaluate expr-lang condition
+            out, err := vm.Run(e.programs[i], env)
+            if err != nil || !matched {
+                continue
+            }
+        }
+        // First match wins
+        return EvalResult{
+            Effect:     rule.Effect,
+            RuleID:     rule.ID,
+            ReasonCode: rule.ReasonCode,
+            Reason:     rule.Reason,
+        }
+    }
+    // No match: apply default_effect
+    return EvalResult{
+        Effect:     e.doc.DefaultEffect,
+        ReasonCode: "UNMATCHED_DENY",
+        Reason:     "no rule matched; applying default_effect",
+    }
+}
+```
+
+<Warning>
+**Order matters!** Specific rules must appear before general catch-all rules. A `tool: "*"` rule matches everything, so place it last.
+</Warning>
+
+## Effects
+
+Four governance effects are supported:
+
+| Effect | Behavior | Use Case |
+|--------|----------|----------|
+| **PERMIT** | Action is allowed | Explicitly allow safe operations |
+| **DENY** | Action is blocked immediately | Block dangerous operations |
+| **DEFER** | Action requires human approval | High-value operations, manual review |
+| **SHADOW** | Permit + log what would have happened | Test policies in observability mode |
+
+## Expression Language (expr-lang)
+
+Conditions are written in [expr-lang](https://github.com/expr-lang/expr), which compiles to bytecode for fast evaluation:
+
+```yaml
+rules:
+  # Simple comparison
+  - match:
+      tool: stripe/refund
+      when: 'args["amount"] > 1000'
+    effect: defer
+
+  # String matching with regex
+  - match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]"'
+    effect: deny
+
+  # Array operations
+  - match:
+      tool: send_email
+      when: 'len(args["recipients"]) > 50'
+    effect: deny
+
+  # History-based conditions
+  - match:
+      tool: http/post
+      when: 'history_contains_within("read_file", 120)'
+    effect: defer
+    reason: file read followed by HTTP POST within 2 minutes
+
+  # Session state
+  - match:
+      tool: "*"
+      when: 'session.call_count > 100'
+    effect: deny
+    reason: session call limit exceeded
+```
+
+<Note>
+Expressions compile once at policy load time. Evaluation is ~1μs per rule, making governance overhead negligible.
+</Note>
+
+## Evaluation Context
+
+The following variables are available in `when` conditions:
+
+### `args`
+Tool arguments as a map:
+```yaml
+when: 'args["amount"] > 500'
+when: 'args["cmd"] matches "rm"'
+```
+
+### `vars`
+Policy-defined variables:
+```yaml
+vars:
+  max_refund: 500
+rules:
+  - when: 'args["amount"] > vars["max_refund"]'
+```
+
+### `session`
+Session-level state:
+- `session.call_count` — total calls in this session
+- `session.history` — array of recent tool calls
+- `session.cost_usd` — session cost (when CostShield enabled)
+- `session.daily_cost_usd` — daily cost
+
+```yaml
+when: 'session.call_count > 100'
+when: 'session.cost_usd > 50.0'
+```
+
+### `tool`
+Tool metadata from the `tools:` block:
+- `tool.reversibility` — "irreversible" | "reversible" | "compensatable"
+- `tool.blast_radius` — "none" | "local" | "scoped" | "system" | "external"
+- `tool.tags` — array of string tags
+
+```yaml
+when: 'tool.blast_radius == "external"'
+when: 'contains(tool.tags, "financial")'
+```
+
+### `principal`
+Invoking user identity (if available):
+- `principal.id` — IDP-verified identity
+- `principal.tier` — SaaS tier (free, pro, enterprise)
+- `principal.role` — organizational role
+- `principal.org` — organization identifier
+
+```yaml
+when: 'principal.tier == "free" && args["amount"] > 100'
+```
+
+### `delegation`
+Delegation chain (multi-agent scenarios):
+- `delegation.depth` — chain depth (0 = direct)
+- `delegation.origin_agent` — root orchestrator agent ID
+- `delegation.origin_org` — root organization
+
+```yaml
+when: 'delegation.depth > 2'
+```
+
+### `time`
+Temporal conditions (UTC):
+- `time.hour` — current hour (0-23)
+- `time.weekday` — day of week (1=Mon, 7=Sun)
+- `time.month` — month (1-12)
+- `time.day` — day of month (1-31)
+
+```yaml
+when: 'time.hour < 8 || time.hour > 18'  # outside business hours
+```
+
+## History Functions
+
+Three built-in functions query session history:
+
+### `history_contains_within(tool_pattern, seconds)`
+Returns true if any call matching `tool_pattern` occurred within the last N seconds:
+```yaml
+when: 'history_contains_within("http/post", 120)'
+```
+
+### `history_sequence(tool_a, tool_b, ...)`
+Returns true if the given tools appear in that order in recent history:
+```yaml
+when: 'history_sequence("read_file", "shell/exec", "http/post")'
+reason: suspicious sequence detected
+```
+
+### `history_tool_count(tool_pattern)`
+Returns how many calls to tools matching the pattern are in the history window:
+```yaml
+when: 'history_tool_count("stripe/*") > 3'
+```
+
+See `internal/core/policy/engine.go:324` for implementation details.
+
+## Real-World Policy Examples
+
+### Deny destructive shell commands
+```yaml policies/demo.yaml:38
+- id: deny-destructive-shell
+  match:
+    tool: shell/run
+    when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs"'
+  effect: deny
+  reason: destructive shell command blocked by policy
+  reason_code: DESTRUCTIVE_SHELL_COMMAND
+  incident_category: destructive_command
+  incident_severity: critical
+```
+
+### Require approval for high-value refunds
+```yaml policies/demo.yaml:49
+- id: defer-high-value-refund
+  match:
+    tool: stripe/refund
+    when: 'args["amount"] > vars["max_refund"]'
+  effect: defer
+  reason: refund exceeds threshold and requires finance approval
+  reason_code: HIGH_VALUE_REFUND
+  incident_category: financial_threshold
+  incident_severity: high
+```
+
+### Deny mass email operations
+```yaml policies/demo.yaml:60
+- id: deny-mass-email
+  match:
+    tool: send_email
+    when: 'len(args["recipients"]) > vars["max_email_recipients"]'
+  effect: deny
+  reason: mass email to more than 50 recipients requires manual review
+  reason_code: MASS_EMAIL_LIMIT
+```
+
+## Validation in CI
+
+Validate policies before deployment:
+
+```bash
+faramesh policy validate policies/payment.yaml
+# Parses YAML, validates rule structure, compiles all when-conditions.
+# Exits 0 on success, 1 on error. Drop into any CI pipeline.
+```
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    How the policy engine fits into the core
+  </Card>
+  <Card title="DEFER Workflow" icon="clock" href="/concepts/defer-workflow">
+    Human-in-the-loop approval
+  </Card>
+  <Card title="DPR Chain" icon="link" href="/concepts/dpr-chain">
+    Every decision is recorded
+  </Card>
+  <Card title="WAL Ordering" icon="database" href="/concepts/wal-ordering">
+    Audit-first enforcement
+  </Card>
+</CardGroup>

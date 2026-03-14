@@ -1,0 +1,183 @@
+---
+title: 'Architecture'
+description: 'Unified governance plane architecture: invariant core + thin adapters'
+---
+
+## Overview
+
+Faramesh is built on a fundamental architectural principle that has powered every successful infrastructure control plane: **unified core + thin adapters**. Terraform has one HCL language and thin provider adapters. Vault has one core and pluggable backends. Faramesh follows the same proven model.
+
+<Info>
+The invariant core processes every governance decision identically, regardless of which adapter delivered the request. A policy written for a Python notebook works unchanged in production Kubernetes.
+</Info>
+
+## The Faramesh Invariant
+
+Every tool call flows through the same pipeline:
+
+```
+┌──────────────────────── FARAMESH INVARIANT CORE ────────────────────────┐
+│  Policy Engine │ DPR Chain │ Session State │ DEFER Workflow │ Cloud     │
+│  (YAML+expr)   │ (WAL-first│               │ (channel park) │ Platform  │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │ CanonicalActionRequest + DPR write
+                                 │ (same format regardless of adapter)
+┌────────────────────────────────▼────────────────────────────────────────┐
+│                  ADAPTER STACK (auto-selected per environment)           │
+│                                                                          │
+│  A1: SDK Shim          A2: Local Daemon       A3: Sidecar + Proxy       │
+│  Python/JS/Go/TS       Unix socket + broker   Transparent HTTP/gRPC     │
+│  <60 sec on-ramp       Works everywhere       Network isolation         │
+│                                                                          │
+│  A4: Serverless        A5: MCP Gateway        A6: eBPF (optional)      │
+│  Lambda/Cloud Run      Faramesh IS the MCP    Kernel-level on Linux     │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+┌────────────────────────────────▼────────────────────────────────────────┐
+│  faramesh init --auto-detect                                             │
+│  Detects K8s → Helm chart + NetworkPolicy + sidecar                     │
+│  Detects Lambda → layer ARN + env var template                          │
+│  Detects Jupyter → pip install + govern() snippet                       │
+│  Detects MCP → client config change (one line)                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+## Canonical Action Request (CAR)
+
+Every adapter translates its environment into a **CanonicalActionRequest** before evaluation. This normalized representation flows through the pipeline identically:
+
+```go internal/core/types.go:25
+type CanonicalActionRequest struct {
+    // CallID is a UUID v4 assigned by the adapter for idempotency.
+    CallID string `json:"call_id"`
+
+    // AgentID is the identity of the agent making the call.
+    AgentID string `json:"agent_id"`
+
+    // SessionID groups calls within a single agent session.
+    SessionID string `json:"session_id"`
+
+    // ToolID identifies the tool being called, e.g. "stripe/refund".
+    ToolID string `json:"tool_id"`
+
+    // Args are the raw arguments to the tool call.
+    Args map[string]any `json:"args"`
+
+    // Timestamp is when the adapter received the call.
+    Timestamp time.Time `json:"timestamp"`
+
+    // InterceptAdapter identifies which adapter delivered this request.
+    // "sdk" for A1, "proxy" for A3, "mcp" for A5, "ebpf" for A6.
+    InterceptAdapter string `json:"intercept_adapter"`
+}
+```
+
+<Note>
+**CAR Version**: The current specification is `car/1.0`. All adapters produce identical CAR structures, ensuring policy portability across environments.
+</Note>
+
+## Decision Flow
+
+The core returns a `Decision` to the adapter after evaluation:
+
+```go internal/core/types.go:62
+type Decision struct {
+    // Effect is the governance outcome.
+    Effect Effect `json:"effect"`
+
+    // RuleID is the ID of the first rule that matched.
+    RuleID string `json:"rule_id"`
+
+    // ReasonCode is a machine-readable reason token.
+    ReasonCode string `json:"reason_code"`
+
+    // Reason is a human-readable explanation.
+    Reason string `json:"reason"`
+
+    // DeferToken is set when Effect == DEFER.
+    DeferToken string `json:"defer_token,omitempty"`
+
+    // PolicyVersion is the version string of the active policy.
+    PolicyVersion string `json:"policy_version"`
+}
+```
+
+Four possible effects:
+- **PERMIT** — action is allowed
+- **DENY** — action is blocked
+- **DEFER** — action requires human approval
+- **SHADOW** — observability mode (permit + log what would have happened)
+
+## Internal Package Structure
+
+The invariant core is organized under `internal/core/`:
+
+```
+internal/core/
+├── pipeline.go              — Main governance pipeline (WAL-first, atomic)
+├── types.go                 — Core types (CanonicalActionRequest, Decision)
+├── bootstrap.go             — Auto-detection and init
+├── policy/                  — Policy engine
+│   ├── engine.go            — Rule evaluation engine
+│   ├── schema.go            — Policy YAML schema
+│   └── selectors.go         — External data selectors
+├── dpr/                     — Decision-Provenance Record chain
+│   ├── record.go            — DPR record types
+│   ├── wal.go               — Write-ahead log
+│   ├── sqlite.go            — SQLite backend
+│   └── store_backend.go     — Store interface
+├── defer/                   — DEFER workflow (park, poll, approve/deny)
+│   ├── workflow.go          — DEFER workflow manager
+│   ├── channels/            — Channel-based DEFER signaling
+│   └── backends/            — Pluggable DEFER backends
+├── session/                 — Session state management
+│   ├── state.go             — Session state
+│   ├── backend.go           — Session backend interface
+│   └── memory_backend.go    — In-memory backend
+└── multiagent/              — Multi-agent governance
+    ├── routing.go           — Inter-agent request routing
+    ├── budget.go            — Shared budget management
+    └── linkage.go           — Agent linkage tracking
+```
+
+<CardGroup cols={2}>
+  <Card title="Policy Engine" icon="gavel" href="/concepts/policy-engine">
+    Learn how policy evaluation works
+  </Card>
+  <Card title="Adapters" icon="plug" href="/concepts/adapters">
+    Six adapter types: SDK to eBPF
+  </Card>
+  <Card title="DPR Chain" icon="link" href="/concepts/dpr-chain">
+    Tamper-evident audit trail
+  </Card>
+  <Card title="WAL Ordering" icon="database" href="/concepts/wal-ordering">
+    No execution without audit record
+  </Card>
+</CardGroup>
+
+## Adapter Stack
+
+Adapters are thin translation layers that deliver CanonicalActionRequests to the core:
+
+| Adapter | Environment | Integration Time | Use Case |
+|---------|-------------|------------------|----------|
+| **A1: SDK Shim** | Python/JS/Go/TS | < 60 seconds | Development, notebooks, single-file agents |
+| **A2: Local Daemon** | Any process | 2 minutes | Multi-process local development |
+| **A3: Sidecar + Proxy** | Kubernetes | 5 minutes | Production workloads, network isolation |
+| **A4: Serverless** | Lambda/Cloud Run | 10 minutes | Serverless functions |
+| **A5: MCP Gateway** | MCP clients | 1 line config | Model Context Protocol integration |
+| **A6: eBPF** | Linux kernel | Advanced | Kernel-level enforcement (optional) |
+
+<Info>
+Run `faramesh init --auto-detect` to automatically select and configure the right adapter for your environment.
+</Info>
+
+## Why This Architecture Wins
+
+**Policy portability**: A developer who writes a Faramesh policy for their notebook has already learned everything needed to govern their production Kubernetes fleet. Only the adapter changes.
+
+**Proven model**: Every successful infrastructure control plane was built this way. Terraform, Vault, Datadog, OPA — all share this pattern.
+
+**Zero lock-in**: Adapters are stateless. Switching between SDK shim and sidecar proxy requires no policy changes.
+
+**Fail-closed guarantee**: If an adapter can't reach the core, the decision is DENY. No execution without governance.

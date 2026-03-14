@@ -1,0 +1,239 @@
+---
+title: faramesh audit
+description: Audit operations - stream live decisions and verify DPR chain integrity
+---
+
+## Overview
+
+The `faramesh audit` command group provides tools for observing and verifying governance decisions. Stream live decisions in real-time or verify the cryptographic integrity of your DPR (Decision-Provenance Record) chain.
+
+## Subcommands
+
+### tail
+
+Stream live governance decisions from a running daemon.
+
+```bash
+faramesh audit tail [flags]
+```
+
+#### Flags
+
+<ParamField path="--agent" type="string">
+  Filter by agent ID. If empty, shows decisions from all agents.
+</ParamField>
+
+<ParamField path="--socket" type="string" default="/tmp/faramesh.sock">
+  Daemon Unix socket path.
+</ParamField>
+
+#### Example Output
+
+```bash
+$ faramesh audit tail
+
+Faramesh Audit Tail — streaming decisions (Ctrl+C to stop)
+
+[10:00:15] PERMIT  get_exchange_rate      payment-bot       rule=allow-readonly  11ms
+[10:00:17] DENY    shell/run              payment-bot       rule=deny-destructive-shell  0ms
+[10:00:18] PERMIT  read_customer          customer-svc      rule=allow-readonly  9ms
+[10:00:20] DEFER   stripe/refund          payment-bot       rule=defer-high-value-refund  5ms
+[10:00:21] DENY    send_email             notify-agent      rule=deny-mass-email  5ms
+[10:00:23] PERMIT  stripe/refund          payment-bot       12ms
+```
+
+#### Color Coding
+
+- <span style={{color: '#16a34a', fontWeight: 'bold'}}>PERMIT</span> — Green, action allowed
+- <span style={{color: '#dc2626', fontWeight: 'bold'}}>DENY</span> — Red, action blocked
+- <span style={{color: '#eab308', fontWeight: 'bold'}}>DEFER</span> — Yellow, awaiting approval
+- <span style={{color: '#6b7280'}}>SHADOW</span> — Gray, observation mode
+
+#### Filter by Agent
+
+```bash
+faramesh audit tail --agent payment-bot
+```
+
+Shows only decisions for the `payment-bot` agent.
+
+#### Use Cases
+
+- **Real-time monitoring**: Watch agents make decisions in production
+- **Policy debugging**: Verify rules are firing as expected
+- **Security monitoring**: Detect unexpected DENY or DEFER patterns
+- **Performance analysis**: Track decision latency
+
+<Note>
+The daemon must be running (`faramesh serve`) for `audit tail` to work.
+</Note>
+
+---
+
+### verify
+
+Verify the SHA256 chain integrity of a DPR SQLite database.
+
+```bash
+faramesh audit verify <db-path>
+```
+
+#### What It Checks
+
+Each DPR record contains:
+
+- `record_hash` — SHA256 of this record's canonical bytes
+- `prev_record_hash` — SHA256 of the previous record (linked list)
+- `policy_version` — Hash of the active policy at decision time
+- `args_structural_sig` — Shape hash of arguments (never raw values)
+
+The verify command:
+
+1. Reads all records from the SQLite database
+2. Recomputes the SHA256 hash for each record
+3. Verifies each record's hash matches the stored value
+4. Verifies each record links to the previous record via `prev_record_hash`
+5. Reports any chain violations
+
+#### Example Output
+
+**Valid chain:**
+
+```bash
+$ faramesh audit verify ~/.faramesh/faramesh.db
+
+Verifying DPR chain integrity: /home/user/.faramesh/faramesh.db
+Records to verify: 1,247
+
+✓ Chain integrity verified. 1,247 records, 0 violations.
+```
+
+**Chain violation detected:**
+
+```bash
+$ faramesh audit verify ~/.faramesh/faramesh.db
+
+Verifying DPR chain integrity: /home/user/.faramesh/faramesh.db
+Records to verify: 1,247
+
+✗ CHAIN VIOLATION record 823: dpr_1a2b3c4d
+✗ CHAIN VIOLATION record 824: dpr_2b3c4d5e
+
+✗ 2 chain integrity violation(s) detected.
+```
+
+Exit code: **1** on violations, **0** on success.
+
+#### When to Use
+
+- **Compliance audits**: Prove audit trail is tamper-evident
+- **Forensics**: Detect unauthorized modification of audit records
+- **Post-incident review**: Verify audit trail hasn't been altered
+- **Scheduled verification**: Run as a cron job to detect tampering
+
+#### DPR Record Structure
+
+Each record contains:
+
+```json
+{
+  "record_id": "dpr_abc123",
+  "record_hash": "sha256:...",
+  "prev_record_hash": "sha256:...",
+  "agent_id": "payment-bot",
+  "tool_id": "stripe/refund",
+  "effect": "DEFER",
+  "policy_version": "sha256:...",
+  "args_structural_sig": "sha256:...",
+  "timestamp": "2026-03-14T10:00:20Z",
+  "latency_ms": 5,
+  "rule_id": "defer-high-value-refund",
+  "reason_code": "HIGH_VALUE_REFUND"
+}
+```
+
+<Warning>
+**Important**: DPR records contain the **structural signature** of arguments (their type and shape), never raw argument values. This prevents leaking sensitive data like customer IDs, amounts, or credentials into the audit trail.
+</Warning>
+
+---
+
+## DPR Chain Visualization
+
+```
+Genesis Record
+    |
+    v
+[dpr_000001] ──┐
+    hash: abc   │
+    prev: null  │
+                │
+    ┌───────────┘
+    v
+[dpr_000002] ──┐
+    hash: def   │
+    prev: abc   │
+                │
+    ┌───────────┘
+    v
+[dpr_000003] ──┐
+    hash: ghi   │
+    prev: def   │
+                │
+    v
+   ...
+```
+
+Each record cryptographically links to the previous one, forming a tamper-evident chain. Modifying any record breaks the chain.
+
+---
+
+## WAL-First Guarantee
+
+Faramesh guarantees **no execution without an audit record** via a write-ahead log (WAL):
+
+```
+CanonicalActionRequest
+ │
+ ├─ Kill switch check
+ ├─ Pre-execution scanners
+ ├─ Session state read
+ ├─ Policy evaluation
+ ├─ Decision: PERMIT | DENY | DEFER
+ │
+ ├─ WAL write ────────── fsync to disk BEFORE returning
+ │                       (if this fails → DENY)
+ ├─ Return to agent
+ │
+ └─ [Async]
+    ├─ Replicate to SQLite DPR
+    ├─ Update session counters
+    └─ Sync to Horizon (if enabled)
+```
+
+If the process crashes between WAL write and SQLite replication, the WAL replays on restart. **No gap in the audit chain is possible.**
+
+---
+
+## Audit Trail Export
+
+<Note>
+Full audit trail export to CSV, JSON, or compliance formats (SOC 2, HIPAA, EU AI Act) is available via [Faramesh Horizon](/advanced/cloud-platform).
+</Note>
+
+For local export:
+
+```bash
+sqlite3 ~/.faramesh/faramesh.db \
+  "SELECT * FROM dpr_records ORDER BY timestamp" \
+  > audit.csv
+```
+
+---
+
+## Related Commands
+
+- [`faramesh serve`](/cli/serve) — Start daemon to generate audit records
+- [`faramesh agent approve`](/cli/agent#approve) — Approve DEFER actions (creates audit record)
+- [`faramesh policy test`](/cli/policy#test) — Dry-run decisions (no audit record)
+- [`faramesh demo`](/cli/demo) — See audit stream in action

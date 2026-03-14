@@ -1,0 +1,284 @@
+---
+title: 'Adapters'
+description: 'Six adapter types: SDK Shim to eBPF — choose the right integration for your environment'
+---
+
+## Overview
+
+Adapters are thin translation layers that deliver **CanonicalActionRequests** to the invariant core. Every adapter translates its environment into the same normalized format, ensuring that policies are portable across all deployment modes.
+
+<Info>
+**Auto-detection**: Run `faramesh init --auto-detect` to automatically select and configure the right adapter for your environment.
+</Info>
+
+## The Six Adapter Types
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                  ADAPTER STACK (auto-selected per environment)         │
+│                                                                        │
+│  A1: SDK Shim          A2: Local Daemon       A3: Sidecar + Proxy     │
+│  Python/JS/Go/TS       Unix socket + broker   Transparent HTTP/gRPC   │
+│  <60 sec on-ramp       Works everywhere       Network isolation       │
+│                                                                        │
+│  A4: Serverless        A5: MCP Gateway        A6: eBPF (optional)    │
+│  Lambda/Cloud Run      Faramesh IS the MCP    Kernel-level on Linux   │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+## A1: SDK Shim
+
+**Environment**: Python, JavaScript, Go, TypeScript  
+**Integration time**: < 60 seconds  
+**Use case**: Development, notebooks, single-file agents
+
+The SDK shim wraps any function with governance. It auto-starts the daemon on first call.
+
+### Python Example
+
+```python
+from faramesh import govern
+
+# govern() wraps any callable.
+# Preserves type hints, Pydantic models, LangChain @tool metadata.
+governed_refund = govern(
+    stripe_refund,
+    policy='payment.yaml',
+    agent_id='payment-bot'
+)
+
+try:
+    result = governed_refund(amount=100, currency='usd')
+except DenyError as e:
+    print(f"DENY: {e.reason}")    # policy blocked it
+except DeferredError as e:
+    print(f"DEFER: approve with: faramesh agent approve {e.defer_token}")
+```
+
+### LangChain Integration
+
+```python
+from langchain.tools import tool
+from faramesh import govern
+
+@tool
+def stripe_refund(amount: float, currency: str) -> str:
+    """Refund a charge via Stripe."""
+    ...
+
+governed_refund = govern(stripe_refund, policy='payment.yaml', agent_id='payment-bot')
+# LangChain tool metadata (name, description, args_schema) is fully preserved.
+```
+
+<Note>
+The `govern()` decorator auto-starts the faramesh daemon on first call. No separate setup in development.
+</Note>
+
+## A2: Local Daemon
+
+**Environment**: Any process  
+**Integration time**: 2 minutes  
+**Use case**: Multi-process local development
+
+The local daemon runs as a Unix socket server. Agents connect via the socket to request governance decisions.
+
+```bash
+# Start the daemon
+faramesh serve --policy payment.yaml
+
+# The daemon loads the policy, opens the WAL and DPR store,
+# and starts accepting connections on /tmp/faramesh.sock
+```
+
+SDKs connect automatically:
+
+```python
+# SDK auto-detects /tmp/faramesh.sock
+governed_refund = govern(stripe_refund, agent_id='payment-bot')
+```
+
+<Info>
+The local daemon is stateful: it maintains session state, DPR chain, and DEFER handles in memory. Restart the daemon to reset state.
+</Info>
+
+## A3: Sidecar + Proxy
+
+**Environment**: Kubernetes  
+**Integration time**: 5 minutes  
+**Use case**: Production workloads, network isolation
+
+In Kubernetes, Faramesh runs as a sidecar container that intercepts HTTP/gRPC traffic. Agents communicate with external APIs through the proxy, which enforces governance transparently.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: payment-agent
+spec:
+  containers:
+    - name: agent
+      image: your-agent:latest
+      env:
+        - name: HTTP_PROXY
+          value: http://localhost:8080
+        - name: FARAMESH_AGENT_ID
+          value: payment-bot
+    - name: faramesh-sidecar
+      image: ghcr.io/faramesh/faramesh:latest
+      args:
+        - serve
+        - --policy=/config/payment.yaml
+        - --mode=sidecar
+      volumeMounts:
+        - name: policy
+          mountPath: /config
+```
+
+<Note>
+The sidecar proxy enforces governance on **all** HTTP/gRPC calls from the agent. No code changes required in the agent.
+</Note>
+
+### NetworkPolicy Integration
+
+Combine with Kubernetes NetworkPolicy to enforce that agents can only reach external APIs through the governed sidecar:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-network-isolation
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-agent
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+      - podSelector:
+          matchLabels:
+            app: faramesh-sidecar
+```
+
+## A4: Serverless
+
+**Environment**: AWS Lambda, Google Cloud Run, Azure Functions  
+**Integration time**: 10 minutes  
+**Use case**: Serverless functions
+
+Faramesh runs as a Lambda layer or Cloud Run sidecar. The SDK connects to the local daemon within the function execution environment.
+
+### AWS Lambda
+
+```bash
+# Add Faramesh layer to your Lambda function
+aws lambda update-function-configuration \
+  --function-name payment-agent \
+  --layers arn:aws:lambda:us-east-1:123456789012:layer:faramesh:1
+```
+
+In your function code:
+
+```python
+import os
+from faramesh import govern
+
+os.environ['FARAMESH_POLICY_URL'] = 's3://my-bucket/payment.yaml'
+
+governed_refund = govern(stripe_refund, agent_id='payment-lambda')
+
+def handler(event, context):
+    return governed_refund(amount=event['amount'], currency='usd')
+```
+
+<Info>
+The serverless adapter starts a minimal daemon within the function's execution environment. Policy is fetched from S3/GCS/Azure Blob on cold start.
+</Info>
+
+## A5: MCP Gateway
+
+**Environment**: Model Context Protocol clients  
+**Integration time**: 1 line config  
+**Use case**: MCP clients (Claude Desktop, Cursor, etc.)
+
+Faramesh **is** the MCP server. MCP clients connect to Faramesh, which proxies tool calls to real MCP servers after governance.
+
+```json mcp-config.json
+{
+  "mcpServers": {
+    "governed-stripe": {
+      "command": "faramesh",
+      "args": ["mcp", "--policy=payment.yaml", "--upstream=stripe-mcp-server"]
+    }
+  }
+}
+```
+
+The MCP gateway:
+1. Receives tool calls from MCP clients
+2. Evaluates them against the policy
+3. Proxies PERMIT'd calls to the upstream MCP server
+4. Returns results or denials to the client
+
+<Note>
+No agent code changes required. Add Faramesh to your MCP client config and governance is enforced transparently.
+</Note>
+
+## A6: eBPF (Optional)
+
+**Environment**: Linux kernel  
+**Integration time**: Advanced (kernel modules)  
+**Use case**: Kernel-level enforcement, zero-trust environments
+
+The eBPF adapter uses kernel probes to intercept syscalls and network traffic at the kernel level. This provides defense-in-depth: even if an agent bypasses SDK governance, kernel-level enforcement remains active.
+
+<Warning>
+**Advanced feature**: eBPF adapter requires kernel 5.8+ and CAP_BPF capability. Not available on macOS/Windows.
+</Warning>
+
+```bash
+# Install eBPF adapter (Linux only)
+sudo faramesh serve --policy payment.yaml --ebpf-probe=network
+
+# The eBPF probe intercepts all network syscalls (socket, connect, send)
+# and enforces governance at the kernel level
+```
+
+## Adapter Selection Guide
+
+| Scenario | Recommended Adapter | Why |
+|----------|---------------------|-----|
+| Local development (Python/JS) | **A1: SDK Shim** | Fastest on-ramp, auto-starts daemon |
+| Local development (multi-process) | **A2: Local Daemon** | Shared daemon across processes |
+| Production Kubernetes | **A3: Sidecar + Proxy** | Network isolation, no code changes |
+| AWS Lambda / Cloud Functions | **A4: Serverless** | Built-in layer, policy from S3 |
+| MCP clients (Claude, Cursor) | **A5: MCP Gateway** | Drop-in MCP server replacement |
+| Zero-trust environments | **A6: eBPF** | Kernel-level enforcement |
+
+<Info>
+Run `faramesh init --auto-detect` to automatically detect your environment and generate the right adapter config.
+</Info>
+
+## Adapter Invariants
+
+All adapters share these properties:
+
+✅ **Stateless**: Adapters hold no policy or session state. They forward requests to the core.  
+✅ **Fail-closed**: If the adapter can't reach the core, the decision is DENY.  
+✅ **Identical CAR**: All adapters produce the same CanonicalActionRequest format.  
+✅ **Policy portability**: A policy written for A1 works unchanged on A3, A4, A5, A6.
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    How adapters fit into the invariant core
+  </Card>
+  <Card title="Policy Engine" icon="gavel" href="/concepts/policy-engine">
+    Rules that adapters enforce
+  </Card>
+  <Card title="DEFER Workflow" icon="clock" href="/concepts/defer-workflow">
+    Human-in-the-loop across all adapters
+  </Card>
+  <Card title="WAL Ordering" icon="database" href="/concepts/wal-ordering">
+    Audit-first across all adapters
+  </Card>
+</CardGroup>

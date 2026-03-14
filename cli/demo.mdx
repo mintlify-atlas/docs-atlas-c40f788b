@@ -1,0 +1,174 @@
+---
+title: faramesh demo
+description: Run an interactive demonstration of Faramesh governance with synthetic agent and pre-loaded policy
+---
+
+## Overview
+
+`faramesh demo` is the "docker run hello-world" moment for Faramesh. It starts a synthetic agent with a pre-loaded demo policy and streams live authorization decisions to your terminal in under 3 seconds.
+
+Zero configuration. Zero infrastructure. See PERMIT, DENY, and DEFER decisions immediately.
+
+## Usage
+
+```bash
+faramesh demo
+```
+
+## What It Does
+
+The demo command:
+
+1. **Loads a pre-configured policy** with representative governance rules
+2. **Creates an in-memory pipeline** (no disk, no socket, no infrastructure)
+3. **Executes 5 synthetic tool calls** covering the most important governance scenarios
+4. **Streams color-coded decisions** to your terminal in real-time
+
+## Demo Scenarios
+
+The demo evaluates 5 canonical scenarios:
+
+### 1. Currency Exchange (PERMIT)
+
+```
+[10:00:15] PERMIT  get_exchange_rate      from=USD to=SEK              latency=11ms
+```
+
+A safe, read-only API call that is permitted by policy.
+
+### 2. Destructive Shell Command (DENY)
+
+```
+[10:00:17] DENY    shell/run              cmd="rm -rf /"               scanner=SCANNER_DENY  latency=0ms
+```
+
+Blocked by the pre-execution scanner before reaching the policy engine.
+
+### 3. Customer Data Read (PERMIT)
+
+```
+[10:00:18] PERMIT  read_customer          id=cust_abc123               latency=9ms
+```
+
+Another permitted operation demonstrating read access governance.
+
+### 4. High-Value Refund (DEFER)
+
+```
+[10:00:20] DEFER   stripe/refund          amount=$12,000               awaiting approval  policy=defer-high-value-refund
+```
+
+Exceeds the policy threshold (`max_refund: 500`) and requires human approval.
+
+### 5. Mass Email (DENY)
+
+```
+[10:00:21] DENY    send_email             recipients=847               policy=deny-mass-email  latency=5ms
+```
+
+Blocked by policy rule preventing bulk email operations.
+
+## Example Output
+
+```bash
+$ faramesh demo
+
+Faramesh — Unified Agent Governance
+Starting synthetic agent with demo policy...
+
+[10:00:15] PERMIT  get_exchange_rate      from=USD to=SEK              latency=11ms
+[10:00:17] DENY    shell/run              cmd="rm -rf /tmp/build"      scanner=SCANNER_DENY  latency=0ms
+[10:00:18] PERMIT  read_customer          id=cust_abc123               latency=9ms
+[10:00:20] DEFER   stripe/refund          amount=$12,000               awaiting approval  policy=defer-high-value-refund  latency=5ms
+[10:00:21] DENY    send_email             recipients=847               policy=deny-mass-email  latency=5ms
+
+─────────────────────────────────────────────
+5 actions evaluated. 2 PERMIT  2 DENY  1 DEFER
+
+Start governing your agent:
+  faramesh serve --policy payment.yaml
+
+Auto-detect your environment:
+  faramesh init
+```
+
+## Decision Effects Explained
+
+<CardGroup cols={3}>
+  <Card title="PERMIT" icon="circle-check" color="#16a34a">
+    Action is allowed and can proceed immediately.
+  </Card>
+  <Card title="DENY" icon="circle-xmark" color="#dc2626">
+    Action is blocked. Agent receives immediate rejection.
+  </Card>
+  <Card title="DEFER" icon="clock" color="#eab308">
+    Action requires human approval before proceeding.
+  </Card>
+</CardGroup>
+
+## Technical Details
+
+### In-Memory Pipeline
+
+The demo runs entirely in memory with:
+
+- **No disk I/O**: Uses `NullWAL` instead of persistent write-ahead log
+- **No Unix socket**: Direct function calls to the governance pipeline
+- **No external dependencies**: Self-contained with embedded demo policy
+- **Microsecond latency**: Policy rules compile to bytecode and evaluate at ~1μs per rule
+
+### Demo Policy
+
+The embedded demo policy includes:
+
+```yaml
+rules:
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]"'
+    effect: deny
+
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 500'
+    effect: defer
+
+  - id: deny-mass-email
+    match:
+      tool: send_email
+      when: 'len(args["recipients"]) > 50'
+    effect: deny
+```
+
+## Next Steps
+
+After running the demo:
+
+1. **Initialize your environment**
+   ```bash
+   faramesh init
+   ```
+
+2. **Create your own policy**
+   ```bash
+   faramesh policy validate faramesh/policy.yaml
+   ```
+
+3. **Start the daemon**
+   ```bash
+   faramesh serve --policy faramesh/policy.yaml
+   ```
+
+4. **Stream live decisions**
+   ```bash
+   faramesh audit tail
+   ```
+
+## Related Commands
+
+- [`faramesh init`](/cli/init) — Auto-detect environment and generate config
+- [`faramesh serve`](/cli/serve) — Start the governance daemon
+- [`faramesh policy validate`](/cli/policy#validate) — Validate a policy file
+- [`faramesh audit tail`](/cli/audit#tail) — Stream live decisions

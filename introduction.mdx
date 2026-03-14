@@ -1,0 +1,163 @@
+---
+title: Introduction
+description: Unified governance plane for AI agents with pre-execution authorization, policy-as-code, and tamper-evident audit trails
+---
+
+## What is Faramesh?
+
+Faramesh is a unified governance plane for AI agents that provides **pre-execution authorization**, **policy-as-code**, and **tamper-evident audit trails**. It sits between your agents and their tools, evaluating every action before it executes.
+
+<CardGroup cols={3}>
+  <Card title="Pre-execution Authorization" icon="shield-check">
+    Every agent action is evaluated against policies before execution. No action runs without approval.
+  </Card>
+  <Card title="Policy-as-Code" icon="file-code">
+    Define governance rules in YAML with expr-lang conditions. Version control your policies alongside your code.
+  </Card>
+  <Card title="Tamper-evident Audit" icon="link">
+    Every decision is recorded in a cryptographically linked DPR chain. Verify integrity with SHA256 hashing.
+  </Card>
+</CardGroup>
+
+## Core Value Proposition
+
+### PERMIT / DENY / DEFER Decisions
+
+Faramesh evaluates every agent action and returns one of three decisions:
+
+- **PERMIT** — Action is allowed and executes immediately
+- **DENY** — Action is blocked with a structured reason code
+- **DEFER** — Action requires human approval before proceeding
+
+```python
+from faramesh import govern
+
+# Wrap any function with governance
+governed_refund = govern(stripe_refund, policy='payment.yaml', agent_id='payment-bot')
+
+try:
+    result = governed_refund(amount=100, currency='usd')
+except DenyError as e:
+    print(f"DENY: {e.reason}")    # policy blocked it
+except DeferredError as e:
+    print(f"DEFER: approve with: faramesh agent approve {e.defer_token}")
+```
+
+### Zero Infrastructure in Development
+
+The Python SDK auto-starts the Faramesh daemon on first call. No separate setup required:
+
+```bash
+pip install faramesh
+```
+
+```python
+from faramesh import govern
+
+@govern
+def send_email(to: str, subject: str, body: str) -> dict:
+    ...  # your email sending code
+
+# Daemon starts automatically on first call
+send_email("ceo@example.com", "Q4 Forecast", "...")
+```
+
+## Architecture Principle: Unified Core + Thin Adapters
+
+Every successful infrastructure control plane — Terraform, Vault, Datadog, OPA — was built on one architecture decision: **unified core + thin adapters**.
+
+- **Terraform**: One HCL language, thin provider adapters
+- **Vault**: One core engine, pluggable backends
+- **Faramesh**: One policy engine, multiple adapters
+
+```
+┌──────────────────────── FARAMESH INVARIANT CORE ────────────────────────┐
+│  Policy Engine │ DPR Chain │ Session State │ DEFER Workflow │ Cloud     │
+│  (YAML+expr)   │ (WAL-first│               │ (channel park) │ Platform  │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │ CanonicalActionRequest + DPR write
+                                 │ (same format regardless of adapter)
+┌────────────────────────────────▼────────────────────────────────────────┐
+│                  ADAPTER STACK (auto-selected per environment)           │
+│                                                                          │
+│  A1: SDK Shim          A2: Local Daemon       A3: Sidecar + Proxy       │
+│  Python/JS/Go/TS       Unix socket + broker   Transparent HTTP/gRPC     │
+│  <60 sec on-ramp       Works everywhere       Network isolation         │
+│                                                                          │
+│  A4: Serverless        A5: MCP Gateway        A6: eBPF (optional)      │
+│  Lambda/Cloud Run      Faramesh IS the MCP    Kernel-level on Linux     │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+A developer who writes a Faramesh policy for their notebook has already learned everything needed to govern their production Kubernetes fleet. **Only the adapter changes** — and `faramesh init` selects it automatically.
+
+## The WAL Ordering Invariant
+
+Every governance decision has a durable audit record **before** it is returned to the caller. No execution without an audit record — under any failure mode.
+
+<Steps>
+  <Step title="Kill switch check">
+    Atomic boolean check per agent_id — nanoseconds
+  </Step>
+  <Step title="Pre-execution scanners">
+    Shell, secret, PII detection — parallel goroutines
+  </Step>
+  <Step title="Policy evaluation">
+    Expr-lang bytecode, first-match-wins, ~1μs per rule
+  </Step>
+  <Step title="Decision rendered">
+    PERMIT | DENY | DEFER | SHADOW
+  </Step>
+  <Step title="WAL write (critical)">
+    fsync to local disk BEFORE returning decision
+  </Step>
+  <Step title="Return to caller">
+    Only after WAL write succeeds
+  </Step>
+</Steps>
+
+If the WAL write fails → automatic DENY. If the process crashes between WAL write and DPR update, the WAL replays on restart. **No gap in the audit chain is possible.**
+
+## The Faramesh Ecosystem
+
+Faramesh is a suite of standalone tools that work together as a unified governance plane:
+
+<CardGroup cols={2}>
+  <Card title="Core" icon="shield">
+    Pre-execution policy engine, DPR audit chain, DEFER workflow
+  </Card>
+  <Card title="Tesseract" icon="eye">
+    Pre-governance observation — see what agents do before writing policies
+  </Card>
+  <Card title="Hub" icon="box">
+    Open-source policy pack registry with community packs
+  </Card>
+  <Card title="Sverm" icon="network-wired">
+    Cross-agent behavioral analysis and swarm governance
+  </Card>
+  <Card title="CostShield" icon="dollar-sign">
+    Pre-execution cost governance — prevent runaway LLM/API spend
+  </Card>
+  <Card title="Supply Chain" icon="signature">
+    Cryptographic signing, SBOM, reproducible build verification
+  </Card>
+</CardGroup>
+
+All tools connect via the **Mesh** protocol — when multiple tools run on the same machine, they discover each other automatically and exchange data through authenticated Unix domain sockets.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get to a working governance example in under 5 minutes
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Install Faramesh via Homebrew, install script, Docker, or pip
+  </Card>
+  <Card title="Policy Language" icon="code" href="/policy/overview">
+    Learn how to write governance policies in YAML
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Deep dive into the unified core and adapter architecture
+  </Card>
+</CardGroup>

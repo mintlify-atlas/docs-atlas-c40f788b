@@ -1,0 +1,362 @@
+---
+title: Expression Language
+description: expr-lang syntax for dynamic policy conditions in Faramesh
+---
+
+Faramesh policies use [expr-lang](https://expr-lang.org/) for dynamic conditions in rule `when` clauses. Expressions are compiled to bytecode at policy load time and evaluated at ~1μs per rule.
+
+## Basic Syntax
+
+Expressions must return a boolean value:
+
+```yaml
+rules:
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 500'  # boolean expression
+    effect: defer
+```
+
+## Available Variables
+
+The following variables are available in `when` expressions:
+
+<ParamField path="args" type="object">
+  Tool call arguments as a map
+  
+  ```yaml
+  when: 'args["amount"] > 500'
+  when: 'args["cmd"] matches "rm -rf"'
+  when: 'len(args["recipients"]) > 50'
+  ```
+</ParamField>
+
+<ParamField path="vars" type="object">
+  Policy variables from the `vars` section
+  
+  ```yaml
+  vars:
+    max_refund: 500
+    allowed_domains: ["internal.com", "api.company.com"]
+  
+  rules:
+    - when: 'args["amount"] > vars["max_refund"]'
+    - when: 'args["domain"] in vars["allowed_domains"]'
+  ```
+</ParamField>
+
+<ParamField path="session" type="object">
+  Session state: call count, cost, history
+  
+  ```yaml
+  when: 'session.calls > 100'
+  when: 'session.cost_usd > 5.00'
+  ```
+</ParamField>
+
+<ParamField path="tool" type="object">
+  Tool metadata: reversibility, blast_radius, shadow_safe, tags
+  
+  ```yaml
+  when: 'tool.reversibility == "irreversible"'
+  when: 'tool.blast_radius == "external"'
+  when: '"financial" in tool.tags'
+  ```
+</ParamField>
+
+<ParamField path="principal" type="object">
+  User/agent identity information
+  
+  ```yaml
+  when: 'principal.role == "admin"'
+  when: 'principal.agent_id == "payment-bot"'
+  ```
+</ParamField>
+
+## Operators
+
+### Comparison Operators
+
+```yaml
+# Numeric comparison
+when: 'args["amount"] > 500'
+when: 'args["amount"] >= 500'
+when: 'args["amount"] < 100'
+when: 'args["amount"] <= 100'
+when: 'args["amount"] == 500'
+when: 'args["amount"] != 500'
+
+# String comparison
+when: 'args["status"] == "active"'
+when: 'args["env"] != "production"'
+```
+
+### Logical Operators
+
+```yaml
+# AND
+when: 'args["amount"] > 500 && args["currency"] == "USD"'
+
+# OR
+when: 'args["cmd"] matches "rm -rf" || args["cmd"] matches "mkfs"'
+
+# NOT
+when: '!(args["approved"] == true)'
+```
+
+### String Matching
+
+<CodeGroup>
+
+```yaml matches (regex)
+when: 'args["cmd"] matches "rm\\s+-[rf]"'
+when: 'args["email"] matches "@(internal|company)\\.com$"'
+```
+
+```yaml contains
+when: 'args["message"] contains "password"'
+when: 'args["url"] contains "localhost"'
+```
+
+```yaml startsWith / endsWith
+when: 'args["path"] startsWith "/etc/"'
+when: 'args["file"] endsWith ".sh"'
+```
+
+</CodeGroup>
+
+<Warning>
+  When using `matches` with regex, remember to escape backslashes: `\\s` for `\s`, `\\d` for `\d`, etc.
+</Warning>
+
+### Array Operations
+
+```yaml
+# Array length
+when: 'len(args["recipients"]) > 50'
+
+# Array membership
+when: 'args["domain"] in vars["allowed_domains"]'
+when: '"production" in args["environments"]'
+
+# Array negation
+when: '!(args["domain"] in vars["allowed_domains"])'
+```
+
+### Arithmetic Operators
+
+```yaml
+# Addition, subtraction, multiplication, division
+when: 'args["subtotal"] + args["tax"] > 1000'
+when: 'args["quantity"] * args["price"] > 500'
+when: 'args["total"] / args["count"] > 100'
+```
+
+## Real-World Examples
+
+### Destructive Shell Command Detection
+
+```yaml
+- id: deny-destructive-shell
+  match:
+    tool: shell/run
+    when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs" || args["cmd"] matches "dd if="'
+  effect: deny
+  reason: destructive shell command blocked by policy
+```
+
+This rule blocks shell commands that match common destructive patterns:
+- `rm -rf` or `rm -fr` (recursive force delete)
+- `mkfs` (filesystem creation)
+- `dd if=` (disk copy/wipe)
+
+### High-Value Refund Approval
+
+```yaml
+vars:
+  max_refund: 500
+
+rules:
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold and requires finance approval
+```
+
+### Mass Email Prevention
+
+```yaml
+vars:
+  max_email_recipients: 50
+
+rules:
+  - id: deny-mass-email
+    match:
+      tool: send_email
+      when: 'len(args["recipients"]) > vars["max_email_recipients"]'
+    effect: deny
+    reason: mass email to more than 50 recipients requires manual review
+```
+
+### Domain Allowlist Enforcement
+
+```yaml
+vars:
+  allowed_domains:
+    - internal.example.com
+    - api.company.com
+
+rules:
+  - id: deny-external-http
+    match:
+      tool: http/*
+      when: '!(args["domain"] in vars["allowed_domains"])'
+    effect: deny
+    reason: external HTTP requests to non-allowlisted domains are blocked
+```
+
+### Tool Metadata Checks
+
+```yaml
+tools:
+  stripe/refund:
+    reversibility: irreversible
+    blast_radius: external
+    tags: [financial]
+
+rules:
+  # Defer all irreversible external operations
+  - id: defer-irreversible-external
+    match:
+      tool: "*"
+      when: 'tool.reversibility == "irreversible" && tool.blast_radius == "external"'
+    effect: defer
+    reason: irreversible external operation requires approval
+  
+  # Defer all financial operations over session limit
+  - id: defer-financial-burst
+    match:
+      tool: "*"
+      when: '"financial" in tool.tags && session.calls > 10'
+    effect: defer
+    reason: too many financial operations in this session
+```
+
+### Complex Conditions
+
+```yaml
+- id: defer-suspicious-refund
+  match:
+    tool: stripe/refund
+    when: |
+      args["amount"] > vars["max_refund"] &&
+      (
+        args["reason"] == "requested_by_customer" ||
+        args["reason"] == "duplicate"
+      ) &&
+      session.calls < 5
+  effect: defer
+  reason: high-value refund with suspicious attributes
+```
+
+<Note>
+  Use multi-line strings with `|` for complex expressions to improve readability.
+</Note>
+
+## History Helpers
+
+FPL includes helpers for sequence-aware policy enforcement:
+
+<ParamField path="history_contains_within(tool_pattern, seconds)" type="function">
+  Returns `true` if the specified tool pattern was called within the last N seconds
+  
+  ```yaml
+  when: "history_contains_within('http/post', 120)"
+  ```
+</ParamField>
+
+<ParamField path="history_sequence(tool_a, tool_b, ...)" type="function">
+  Returns `true` if tools appeared in the specified order in session history
+  
+  ```yaml
+  when: "history_sequence('read_file', 'http/post')"
+  ```
+</ParamField>
+
+<ParamField path="history_tool_count(tool_pattern)" type="function">
+  Returns the count of matching tool calls in session history
+  
+  ```yaml
+  when: "history_tool_count('stripe/*') >= 5"
+  ```
+</ParamField>
+
+### Detecting Data Exfiltration Patterns
+
+```yaml
+- id: defer-delete-after-exfil
+  match:
+    tool: "delete_*"
+    when: "history_contains_within('http/post', 120)"
+  effect: defer
+  reason: "Delete blocked: data was sent to external endpoint in the last 2 minutes"
+  reason_code: SEQUENCE_EXFIL_DETECTED
+  incident_category: data_exfiltration
+  incident_severity: high
+```
+
+### Blocking Shell Execution in Suspicious Sessions
+
+```yaml
+- id: deny-shell-in-exfil-sequence
+  match:
+    tool: "shell/*"
+    when: "history_sequence('read_file', 'http/post')"
+  effect: deny
+  reason: "Shell execution denied: session exhibits read-then-exfil pattern"
+  reason_code: SEQUENCE_TRAJECTORY_DANGEROUS
+```
+
+### Rate Anomaly Detection
+
+```yaml
+- id: defer-stripe-burst
+  match:
+    tool: "stripe/*"
+    when: "history_tool_count('stripe/*') >= 5"
+  effect: defer
+  reason: "Stripe call rate anomaly: more than 5 calls in current session"
+  reason_code: SEQUENCE_RATE_ANOMALY
+```
+
+See `policies/examples/sequence_enforcement.yaml` for complete examples.
+
+## Type Safety
+
+Expressions are compiled at policy load time, providing:
+
+- **Syntax validation** — Invalid expressions are caught before deployment
+- **Type checking** — Type mismatches (e.g., comparing string to number) are detected
+- **Fast evaluation** — Compiled to bytecode, evaluated at ~1μs per rule
+
+Validate your policy before deployment:
+
+```bash
+faramesh policy validate policies/payment.yaml
+```
+
+See [Validation Reference](/policy/validation) for details.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Validation" icon="check" href="/policy/validation">
+    Validate policies before deployment
+  </Card>
+  <Card title="Examples" icon="book" href="/policy/examples">
+    Complete policy examples
+  </Card>
+</CardGroup>

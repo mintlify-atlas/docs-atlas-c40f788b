@@ -1,0 +1,339 @@
+---
+title: LangChain Integration
+description: Govern LangChain tools with full metadata preservation
+---
+
+Faramesh integrates seamlessly with [LangChain](https://python.langchain.com/) tools via the `@tool` decorator. The `govern()` wrapper preserves all LangChain metadata — including `name`, `description`, and `args_schema` — so governed tools work exactly like ungoverned ones from the agent's perspective.
+
+## Quick Start
+
+```python
+from langchain.tools import tool
+from faramesh import govern
+
+@tool
+def stripe_refund(amount: float, currency: str) -> str:
+    """Refund a charge via Stripe."""
+    # Actual Stripe API call
+    return f"Refunded {amount} {currency}"
+
+# Wrap the LangChain tool with governance
+governed_refund = govern(
+    stripe_refund,
+    policy='payment.yaml',
+    agent_id='payment-bot'
+)
+
+# LangChain agent can use governed_refund exactly like the original
+# All metadata is preserved
+```
+
+## Metadata Preservation
+
+The `govern()` decorator preserves all LangChain `@tool` metadata:
+
+```python
+from langchain.tools import tool
+from faramesh import govern
+
+@tool
+def send_email(to: str, subject: str, body: str) -> str:
+    """Send an email to a user."""
+    # Email sending logic
+    return "Email sent"
+
+governed_email = govern(send_email, policy='comms.yaml')
+
+# All metadata is preserved:
+assert governed_email.name == send_email.name
+assert governed_email.description == send_email.description
+assert governed_email.args_schema == send_email.args_schema
+assert governed_email.__doc__ == send_email.__doc__
+```
+
+### Preserved Attributes
+
+| Attribute | Description |
+|-----------|-------------|
+| `name` | Tool name (used by the LLM to select the tool) |
+| `description` | Tool description (shown to the LLM) |
+| `args_schema` | Pydantic schema for tool arguments |
+| `__doc__` | Python docstring |
+| `__annotations__` | Type hints |
+| `__wrapped__` | Reference to the original function |
+
+## Complete Example
+
+```python
+from langchain.agents import AgentExecutor, create_openai_tools_agent
+from langchain.tools import tool
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from faramesh import govern, DenyError, DeferredError
+
+# Define LangChain tools
+@tool
+def stripe_refund(amount: float, currency: str) -> str:
+    """Refund a charge via Stripe."""
+    import stripe
+    # Actual Stripe API call
+    return f"Refunded {amount} {currency}"
+
+@tool
+def send_email(to: str, subject: str, body: str) -> str:
+    """Send an email to a customer."""
+    # Email sending logic
+    return f"Email sent to {to}"
+
+@tool
+def run_shell_command(command: str) -> str:
+    """Execute a shell command on the server."""
+    import subprocess
+    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    return result.stdout
+
+# Wrap tools with governance
+governed_refund = govern(stripe_refund, policy='finance.yaml', agent_id='support-bot')
+governed_email = govern(send_email, policy='comms.yaml', agent_id='support-bot')
+governed_shell = govern(run_shell_command, policy='infra.yaml', agent_id='support-bot')
+
+# Create LangChain agent with governed tools
+tools = [governed_refund, governed_email, governed_shell]
+
+llm = ChatOpenAI(model="gpt-4", temperature=0)
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful customer support agent."),
+    ("human", "{input}"),
+    ("placeholder", "{agent_scratchpad}"),
+])
+
+agent = create_openai_tools_agent(llm, tools, prompt)
+agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+# Run the agent
+try:
+    result = agent_executor.invoke({
+        "input": "Refund $50,000 to customer cust_abc123 and send them an email."
+    })
+except DeferredError as e:
+    print(f"Action requires approval: {e.defer_token}")
+    print(f"Run: faramesh agent approve {e.defer_token}")
+except DenyError as e:
+    print(f"Action blocked: {e.reason}")
+```
+
+## Policy Example
+
+A policy file for LangChain tools:
+
+```yaml payment.yaml
+faramesh-version: '1.0'
+agent-id: support-bot
+default_effect: permit
+
+vars:
+  max_refund_auto: 500
+  max_email_recipients: 50
+
+rules:
+  # High-value refunds require approval
+  - id: defer-high-value-refund
+    match:
+      tool: stripe_refund
+      when: 'args["amount"] > vars["max_refund_auto"]'
+    effect: defer
+    reason: refund exceeds $500 threshold — requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+
+  # Block destructive shell commands
+  - id: deny-destructive-shell
+    match:
+      tool: run_shell_command
+      when: 'args["command"] matches "rm\\s+-[rf]|shutdown|reboot"'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL
+
+  # Limit email blast size
+  - id: deny-mass-email
+    match:
+      tool: send_email
+      when: 'len(args["to"].split(",")) > vars["max_email_recipients"]'
+    effect: deny
+    reason: mass email requires manual review
+    reason_code: MASS_EMAIL_LIMIT
+```
+
+## Handling Governance Exceptions
+
+LangChain agents don't natively understand Faramesh exceptions. You have two options:
+
+### Option 1: Catch at the Agent Level
+
+Wrap the entire agent execution:
+
+```python
+from faramesh import DenyError, DeferredError
+
+try:
+    result = agent_executor.invoke({"input": user_input})
+except DenyError as e:
+    # Log and notify
+    print(f"Policy blocked action: {e.reason}")
+    result = {"output": f"I cannot do that: {e.reason}"}
+except DeferredError as e:
+    # Notify operator
+    print(f"Action requires approval: faramesh agent approve {e.defer_token}")
+    result = {"output": "This action requires human approval."}
+```
+
+### Option 2: Custom Tool Wrapper
+
+Create a helper that converts exceptions to tool errors:
+
+```python
+from typing import Callable
+from langchain.tools import tool
+from faramesh import govern, DenyError, DeferredError
+
+def governed_tool(fn: Callable, policy: str, agent_id: str):
+    """Wrap a LangChain tool with governance and exception handling."""
+    governed_fn = govern(fn, policy=policy, agent_id=agent_id)
+    
+    @tool
+    def wrapper(*args, **kwargs):
+        try:
+            return governed_fn(*args, **kwargs)
+        except DenyError as e:
+            return f"[POLICY BLOCKED] {e.reason}"
+        except DeferredError as e:
+            return f"[REQUIRES APPROVAL] Token: {e.defer_token}. Run: faramesh agent approve {e.defer_token}"
+    
+    # Copy metadata from original tool
+    wrapper.name = fn.name
+    wrapper.description = fn.description
+    wrapper.args_schema = fn.args_schema
+    return wrapper
+
+# Usage
+@tool
+def dangerous_action(command: str) -> str:
+    """Execute a dangerous operation."""
+    return "Executed"
+
+safe_action = governed_tool(dangerous_action, policy='safety.yaml', agent_id='agent-1')
+```
+
+## Tool Name Mapping
+
+By default, `govern()` uses the function name as the `tool_id` for policy matching. Override this if your LangChain tool has a custom name:
+
+```python
+@tool(name="stripe_process_refund")  # Custom LangChain tool name
+def process_refund(amount: float) -> str:
+    """Process a refund."""
+    return "Refunded"
+
+# Match the tool name in the policy
+governed = govern(
+    process_refund,
+    policy='payment.yaml',
+    tool_id='stripe_process_refund'  # Must match the @tool name
+)
+```
+
+Then in `payment.yaml`:
+
+```yaml
+rules:
+  - id: defer-refunds
+    match:
+      tool: stripe_process_refund  # Matches tool_id parameter
+      when: 'args["amount"] > 500'
+    effect: defer
+```
+
+## Structured Output Tools
+
+For tools that return Pydantic models:
+
+```python
+from pydantic import BaseModel
+from langchain.tools import tool
+from faramesh import govern
+
+class RefundResult(BaseModel):
+    transaction_id: str
+    amount: float
+    status: str
+
+@tool
+def process_refund(amount: float, currency: str) -> RefundResult:
+    """Process a refund and return structured result."""
+    return RefundResult(
+        transaction_id="txn_123",
+        amount=amount,
+        status="completed"
+    )
+
+governed_refund = govern(process_refund, policy='payment.yaml')
+
+# Return type is preserved
+result = governed_refund(100.0, 'usd')
+assert isinstance(result, RefundResult)
+```
+
+## Multi-Agent Scenarios
+
+If you have multiple LangChain agents, use different `agent_id` values:
+
+```python
+# Finance agent
+finance_refund = govern(stripe_refund, policy='finance.yaml', agent_id='finance-agent')
+finance_tools = [finance_refund, ...]
+finance_agent = create_openai_tools_agent(llm, finance_tools, finance_prompt)
+
+# Support agent
+support_refund = govern(stripe_refund, policy='support.yaml', agent_id='support-agent')
+support_tools = [support_refund, ...]
+support_agent = create_openai_tools_agent(llm, support_tools, support_prompt)
+
+# Each agent has separate budgets, rate limits, and audit trails
+```
+
+## Debugging
+
+View live governance decisions:
+
+```bash
+# In one terminal: start the daemon
+faramesh serve --policy payment.yaml
+
+# In another terminal: tail the audit log
+faramesh audit tail
+```
+
+Output:
+```
+[10:15:32] PERMIT  stripe_refund      amount=100 currency=usd        latency=8ms
+[10:15:45] DEFER   stripe_refund      amount=50000 currency=usd       awaiting approval
+[10:16:02] DENY    run_shell_command  command="rm -rf /"             policy=deny-destructive-shell
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Python SDK" icon="python" href="/integrations/python-sdk">
+    Full Python SDK reference
+  </Card>
+  <Card title="Policy Syntax" icon="file-code" href="/policy/syntax">
+    Write governance policies
+  </Card>
+  <Card title="DEFER Workflow" icon="hourglass" href="/concepts/defer-workflow">
+    Human-in-the-loop approvals
+  </Card>
+  <Card title="Daemon Mode" icon="server" href="/integrations/daemon-mode">
+    Run Faramesh as a persistent service
+  </Card>
+</CardGroup>

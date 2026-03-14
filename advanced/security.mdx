@@ -1,0 +1,394 @@
+---
+title: Security Architecture
+description: Zero-trust governance with pre-execution authorization, workload attestation, and cross-org federation
+---
+
+Faramesh implements a **zero-trust security model** where every action is authorized before execution, regardless of the calling agent's identity or prior permissions.
+
+<Info>
+Faramesh security is built on three pillars: **pre-execution authorization**, **workload attestation**, and **delegation chain verification**.
+</Info>
+
+---
+
+## Zero-Trust Architecture
+
+Faramesh does not rely on network perimeters, VPNs, or implicit trust. Every action is:
+
+1. **Authenticated** — Verify the principal and agent identity
+2. **Authorized** — Evaluate policy rules before execution
+3. **Audited** — Record the decision in the DPR chain
+
+### Pre-Execution Authorization
+
+Unlike traditional access control (role-based, attribute-based), Faramesh evaluates policy **before** the action executes:
+
+```
+Agent calls tool()
+  ↓
+Faramesh intercepts
+  ↓
+Policy evaluation (PERMIT/DENY/DEFER)
+  ↓
+[If PERMIT] Execute tool()
+  ↓
+DPR record written
+```
+
+No execution occurs without a governance decision.
+
+---
+
+## Principal Identity
+
+Faramesh tracks the **invoking principal** separately from the agent identity.
+
+### Identity Types
+
+```go
+type Identity struct {
+    ID       string // IDP-verified identity (user@company.com)
+    Tier     string // SaaS tier (free, pro, enterprise)
+    Role     string // Organizational role (analyst, admin)
+    Org      string // Organization identifier
+    Verified bool   // IDP verification status
+    Method   string // okta, azure_ad, google, spiffe, api_key
+}
+```
+
+### Verification Methods
+
+**IDP Integration:**
+- **Okta** — OIDC/SAML integration
+- **Azure AD** — OIDC + managed identity
+- **Google Workspace** — OIDC tokens
+
+**Workload Identity:**
+- **SPIFFE** — mTLS-based workload attestation
+- **AWS IRSA** — IAM Roles for Service Accounts
+- **GCP Workload Identity** — Service account federation
+- **Azure Managed Identity** — Federated credentials
+
+**API Keys:**
+- Hashed and stored in policy configuration
+- Not recommended for production (use IDP or workload identity)
+
+---
+
+## Workload Attestation
+
+Faramesh uses **workload identity** to prove an agent is running in a trusted environment.
+
+### SPIFFE/SPIRE
+
+SPIFFE provides cryptographic workload identity without shared secrets.
+
+**Setup:**
+
+```yaml
+workload_attestation:
+  enabled: true
+  provider: spiffe
+  spiffe:
+    workload_api_socket: unix:///run/spire/sockets/agent.sock
+    trust_domain: company.com
+```
+
+**How it works:**
+
+1. SPIRE agent issues an **X.509 SVID** to the Faramesh daemon
+2. SVID contains SPIFFE ID: `spiffe://company.com/faramesh/agent/billing`
+3. SVID auto-rotates (typically every hour)
+4. Trust bundles propagate across the trust domain
+
+**Policy integration:**
+
+```yaml
+rules:
+  - id: require-verified-workload
+    match:
+      tool: db/write
+      when: 'principal.method != "spiffe"'
+    effect: deny
+    reason: database writes require SPIFFE-verified workload
+```
+
+---
+
+### Cloud Workload Identity
+
+Faramesh auto-detects cloud environments and uses native workload identity.
+
+**AWS IRSA (EKS):**
+
+```yaml
+workload_attestation:
+  enabled: true
+  provider: aws_irsa
+  role_arn: arn:aws:iam::123456789012:role/faramesh-agent
+```
+
+Detected via `AWS_WEB_IDENTITY_TOKEN_FILE` environment variable.
+
+**GCP Workload Identity (GKE):**
+
+```yaml
+workload_attestation:
+  enabled: true
+  provider: gcp_workload
+  service_account: faramesh@my-project.iam.gserviceaccount.com
+```
+
+Detected via GCE metadata or `GOOGLE_APPLICATION_CREDENTIALS`.
+
+**Azure Managed Identity (AKS):**
+
+```yaml
+workload_attestation:
+  enabled: true
+  provider: azure_managed
+  client_id: ${AZURE_CLIENT_ID}
+```
+
+Detected via `MSI_ENDPOINT` or Azure IMDS.
+
+---
+
+## Delegation Chains
+
+When one agent invokes another, the delegation chain is tracked and verified.
+
+### Delegation Link
+
+```go
+type DelegationLink struct {
+    AgentID          string   // Delegating agent
+    IdentityVerified bool     // Was identity verified?
+    DelegatedAt      int64    // Unix timestamp
+    Scope            []string // Tool patterns permitted
+    Depth            int      // Delegation depth
+    OriginOrg        string   // Cross-org federation
+}
+```
+
+### Policy Constraints
+
+**Limit delegation depth:**
+
+```yaml
+rules:
+  - id: max-delegation-depth
+    match:
+      when: 'delegation.depth > 3'
+    effect: deny
+    reason: delegation depth exceeds maximum
+```
+
+**Require all identities verified:**
+
+```yaml
+rules:
+  - id: require-verified-chain
+    match:
+      when: '!delegation.all_identities_verified()'
+    effect: deny
+    reason: unverified identity in delegation chain
+```
+
+**Scope reduction:**
+
+Each delegation link can reduce the tool scope:
+
+```yaml
+delegation:
+  scope:
+    - db/read
+    - db/query
+  # Child agent cannot invoke db/write (not in scope)
+```
+
+---
+
+## Cross-Org Federation
+
+Faramesh supports **cross-organization trust** for multi-tenant scenarios.
+
+### Trust Documents
+
+A **trust document** is a signed assertion that one org trusts another for specific tools.
+
+```yaml
+trust_document:
+  document_id: alpha-beta-trust-001
+  grantor_org: alpha-corp
+  grantee_org: beta-corp
+  tool_scopes:
+    - api/billing/*
+    - db/read
+  max_tier: enterprise
+  max_delegation_depth: 2
+  issued_at: 2026-01-01T00:00:00Z
+  expires_at: 2027-01-01T00:00:00Z
+```
+
+### Federation Registry
+
+```go
+fr := principal.NewFederationRegistry()
+
+// Register trust
+fr.Register(&principal.TrustDocument{
+    DocumentID:         "trust-001",
+    GrantorOrg:         "alpha-corp",
+    GranteeOrg:         "beta-corp",
+    ToolScopes:         []string{"api/billing/*"},
+    MaxDelegationDepth: 2,
+    ExpiresAt:          time.Now().Add(365 * 24 * time.Hour),
+})
+
+// Check trust
+doc := fr.CheckTrust("alpha-corp", "beta-corp", "api/billing/charge")
+if doc == nil {
+    // No trust relationship
+}
+```
+
+### Policy Integration
+
+```yaml
+rules:
+  - id: deny-untrusted-cross-org
+    match:
+      when: 'delegation.is_external("my-org") && !federation.trusted()'
+    effect: deny
+    reason: cross-org invocation without trust document
+```
+
+---
+
+## Privilege Elevation
+
+Faramesh tracks **privilege elevation** events (e.g., sudo-like operations).
+
+```go
+type ElevationEvent struct {
+    PrincipalID  string
+    FromRole     string
+    ToRole       string
+    ElevatedAt   time.Time
+    ApprovedBy   string
+    DPRID        string
+}
+```
+
+**Policy:**
+
+```yaml
+rules:
+  - id: require-approval-for-elevation
+    match:
+      when: 'principal.role == "admin" && elevation.to_role == "root"'
+    effect: defer
+    reason: root elevation requires approval
+```
+
+---
+
+## Credential Revocation
+
+Faramesh integrates with IDP revocation APIs and CRL/OCSP for certificate-based identity.
+
+### Revocation Checks
+
+**IDP Token Revocation:**
+
+```yaml
+identity:
+  idp:
+    provider: okta
+    revocation_check: true
+    revocation_endpoint: https://company.okta.com/oauth2/v1/revoke
+```
+
+**Certificate Revocation (SPIFFE):**
+
+```yaml
+spiffe:
+  revocation_check: true
+  crl_url: https://spire.company.com/crl
+```
+
+---
+
+## IDP Integration
+
+Faramesh supports standard identity providers via OIDC/SAML.
+
+### Okta
+
+```yaml
+identity:
+  idp:
+    provider: okta
+    domain: company.okta.com
+    client_id: ${OKTA_CLIENT_ID}
+    client_secret: ${OKTA_CLIENT_SECRET}
+```
+
+### Azure AD
+
+```yaml
+identity:
+  idp:
+    provider: azure_ad
+    tenant_id: ${AZURE_TENANT_ID}
+    client_id: ${AZURE_CLIENT_ID}
+```
+
+### Google Workspace
+
+```yaml
+identity:
+  idp:
+    provider: google
+    client_id: ${GOOGLE_CLIENT_ID}
+    hosted_domain: company.com
+```
+
+---
+
+## Best Practices
+
+<Warning>
+**Never disable identity verification in production** — All principals must be verified.
+</Warning>
+
+1. **Use workload identity over API keys** — SPIFFE, IRSA, or cloud-native identity
+2. **Require verified delegation chains** — Deny unverified identities
+3. **Limit delegation depth** — Prevent deep nesting (3-5 is reasonable)
+4. **Use cross-org trust documents** — Explicit, scoped, time-bounded
+5. **Monitor revocation events** — Integrate IDP revocation checks
+
+<Info>
+**SPIFFE is the gold standard** for Kubernetes workload identity — no shared secrets, auto-rotation, and mTLS-based.
+</Info>
+
+---
+
+## Security Guarantees
+
+Faramesh provides the following security guarantees:
+
+1. **No execution without authorization** — WAL-first ordering ensures DPR record before execution
+2. **No credential persistence** — Credentials never touch disk or logs
+3. **No implicit trust** — Every action is explicitly authorized
+4. **Tamper-evident audit** — DPR chain is SHA-256 linked
+5. **Revocation-aware** — IDP token and certificate revocation checks
+
+---
+
+## Related Docs
+
+- [Credential Broker](/advanced/credentials) — Just-in-time credential injection
+- [Policy Configuration](/policy/overview) — Write identity-aware rules
+- [Observability](/advanced/observability) — Security event monitoring

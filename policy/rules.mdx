@@ -1,0 +1,308 @@
+---
+title: Rules Reference
+description: Rule structure, match conditions, and evaluation order in Faramesh policies
+---
+
+Rules are the core of Faramesh policy enforcement. Each rule defines match conditions and an effect to apply when those conditions are met.
+
+## Rule Structure
+
+Every rule is a YAML object with these fields:
+
+<ParamField path="id" type="string" required>
+  Unique identifier for this rule. Used in audit logs and policy diffs.
+  
+  ```yaml
+  id: deny-destructive-shell
+  ```
+</ParamField>
+
+<ParamField path="match" type="object" required>
+  Match conditions that determine when this rule fires
+  
+  ```yaml
+  match:
+    tool: shell/run
+    when: 'args["cmd"] matches "rm\\s+-[rf]"'
+  ```
+</ParamField>
+
+<ParamField path="effect" type="string" required>
+  Action to take when rule matches: `permit`, `deny`, `defer`, or `shadow`
+  
+  ```yaml
+  effect: deny
+  ```
+</ParamField>
+
+<ParamField path="reason" type="string">
+  Human-readable explanation shown to user/operator
+  
+  ```yaml
+  reason: destructive shell command blocked by policy
+  ```
+</ParamField>
+
+<ParamField path="reason_code" type="string">
+  Machine-readable code for programmatic handling
+  
+  ```yaml
+  reason_code: DESTRUCTIVE_SHELL_COMMAND
+  ```
+</ParamField>
+
+<ParamField path="incident_category" type="string">
+  Classification for security incidents: `destructive_command`, `financial_threshold`, `mass_operation`, `data_exfiltration`
+  
+  ```yaml
+  incident_category: destructive_command
+  ```
+</ParamField>
+
+<ParamField path="incident_severity" type="string">
+  Severity level: `critical`, `high`, `medium`, `low`
+  
+  ```yaml
+  incident_severity: critical
+  ```
+</ParamField>
+
+## Match Conditions
+
+The `match` object defines when a rule fires:
+
+<ParamField path="match.tool" type="string" required>
+  Glob pattern matched against the tool ID
+  
+  Examples:
+  - `"stripe/refund"` — exact match
+  - `"stripe/*"` — all Stripe tools
+  - `"shell/*"` — all shell tools
+  - `"*"` — matches any tool (catch-all)
+  
+  ```yaml
+  match:
+    tool: stripe/*
+  ```
+</ParamField>
+
+<ParamField path="match.when" type="string">
+  expr-lang expression evaluated against call context. Must return boolean.
+  
+  Available variables:
+  - `args` — tool call arguments
+  - `vars` — policy variables from `vars` section
+  - `session` — session state (call count, cost, etc)
+  - `tool` — tool metadata (reversibility, blast_radius, tags)
+  - `principal` — user/agent identity
+  
+  ```yaml
+  match:
+    tool: stripe/refund
+    when: 'args["amount"] > vars["max_refund"]'
+  ```
+</ParamField>
+
+<Note>
+  If `when` is omitted, the rule matches all calls to the specified `tool` pattern.
+</Note>
+
+## First-Match-Wins Evaluation
+
+Rules are evaluated in **document order**. The first rule whose match conditions are satisfied determines the effect:
+
+```yaml
+rules:
+  # Rule 1: Specific — catches high-value refunds
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 500'
+    effect: defer
+    reason: refund exceeds threshold and requires finance approval
+    
+  # Rule 2: Specific — catches normal refunds
+  - id: permit-normal-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] <= 500'
+    effect: permit
+    reason: refund within authorized threshold
+    
+  # Rule 3: General — catches everything else
+  - id: default-deny
+    match:
+      tool: "*"
+    effect: deny
+    reason: No matching rule — default deny
+```
+
+<Warning>
+  **Rule order matters!** Always place more specific rules before general catch-all rules.
+  
+  If you swap rules 1 and 3 above, the default-deny would catch all tools (including stripe/refund) and rules 1 and 2 would never fire.
+</Warning>
+
+## Tool Metadata in Rules
+
+Use tool metadata from the `tools` section in rule expressions:
+
+```yaml
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial]
+  
+rules:
+  # Defer all irreversible operations with external blast radius
+  - id: defer-irreversible-external
+    match:
+      tool: "*"
+      when: 'tool.reversibility == "irreversible" && tool.blast_radius == "external"'
+    effect: defer
+    reason: irreversible external operation requires approval
+```
+
+## Real-World Examples
+
+### Block Destructive Shell Commands
+
+```yaml
+- id: deny-destructive-shell
+  match:
+    tool: shell/run
+    when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs" || args["cmd"] matches "dd if="'
+  effect: deny
+  reason: destructive shell command blocked by policy
+  reason_code: DESTRUCTIVE_SHELL_COMMAND
+  incident_category: destructive_command
+  incident_severity: critical
+```
+
+### Require Approval for High-Value Refunds
+
+```yaml
+- id: defer-high-value-refund
+  match:
+    tool: stripe/refund
+    when: 'args["amount"] > vars["max_refund"]'
+  effect: defer
+  reason: refund exceeds threshold and requires finance approval
+  reason_code: HIGH_VALUE_REFUND
+  incident_category: financial_threshold
+  incident_severity: high
+```
+
+### Deny Mass Email Operations
+
+```yaml
+- id: deny-mass-email
+  match:
+    tool: send_email
+    when: 'len(args["recipients"]) > vars["max_email_recipients"]'
+  effect: deny
+  reason: mass email to more than 50 recipients requires manual review
+  reason_code: MASS_EMAIL_LIMIT
+  incident_category: mass_operation
+  incident_severity: medium
+```
+
+### Sequence-Aware Rules
+
+FPL supports history helpers for detecting multi-step attack patterns:
+
+```yaml
+- id: defer-delete-after-exfil
+  match:
+    tool: "delete_*"
+    when: "history_contains_within('http/post', 120)"
+  effect: defer
+  reason: "Delete blocked: data was sent to external endpoint in the last 2 minutes"
+  reason_code: SEQUENCE_EXFIL_DETECTED
+  incident_category: data_exfiltration
+  incident_severity: high
+```
+
+Available history helpers:
+- `history_contains_within(tool_pattern, seconds)` — true if tool was called recently
+- `history_sequence(tool_a, tool_b, ...)` — true if tools appeared in order
+- `history_tool_count(tool_pattern)` — count of matching calls in history
+
+See `policies/examples/sequence_enforcement.yaml` for complete examples.
+
+## Effect Types
+
+<AccordionGroup>
+  <Accordion title="PERMIT" icon="check">
+    Allow the tool call to proceed immediately.
+    
+    ```yaml
+    effect: permit
+    reason: refund within authorized threshold
+    ```
+  </Accordion>
+  
+  <Accordion title="DENY" icon="ban">
+    Block the tool call. Return error to agent.
+    
+    ```yaml
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+    ```
+  </Accordion>
+  
+  <Accordion title="DEFER" icon="pause">
+    Pause execution and send to human approver. Agent waits for approval.
+    
+    ```yaml
+    effect: defer
+    reason: refund exceeds threshold and requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+    ```
+  </Accordion>
+  
+  <Accordion title="SHADOW" icon="eye">
+    Allow the call but mark it as "shadow mode" — useful for observability.
+    
+    ```yaml
+    effect: shadow
+    reason: observing new API before full rollout
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Incident Metadata
+
+For security/compliance use cases, attach incident metadata to rules:
+
+```yaml
+- id: deny-destructive-shell
+  match:
+    tool: shell/run
+    when: 'args["cmd"] matches "rm\\s+-[rf]"'
+  effect: deny
+  reason: destructive shell command blocked by policy
+  reason_code: DESTRUCTIVE_SHELL_COMMAND
+  incident_category: destructive_command  # for SIEM integration
+  incident_severity: critical              # for alerting/triage
+```
+
+This metadata flows through to:
+- Audit logs (WAL and SQLite)
+- Webhook events
+- SIEM/security dashboards
+- Incident response systems
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Expressions Reference" icon="brackets-curly" href="/policy/expressions">
+    Learn expr-lang syntax for when clauses
+  </Card>
+  <Card title="Policy Examples" icon="book" href="/policy/examples">
+    Complete policy examples for common use cases
+  </Card>
+</CardGroup>

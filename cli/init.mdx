@@ -1,0 +1,259 @@
+---
+title: faramesh init
+description: Auto-detect your environment and generate Faramesh configuration
+---
+
+## Overview
+
+`faramesh init` analyzes your environment and generates the exact configuration needed to deploy governed agents. It detects Kubernetes, Docker, Lambda, MCP servers, Python/Node.js runtimes and creates environment-specific setup files.
+
+## Usage
+
+```bash
+faramesh init [flags]
+```
+
+## Flags
+
+<ParamField path="--auto-detect" type="boolean" default="true">
+  Auto-detect environment. Always enabled by default.
+</ParamField>
+
+## Environment Detection
+
+Faramesh detects the following environments:
+
+<AccordionGroup>
+  <Accordion title="Kubernetes (A3 — Sidecar + Transparent Proxy)">
+    **Detected when**: `kubectl` command is available
+
+    **Generated files**:
+    - `faramesh/policy.yaml` — Policy skeleton
+    - `faramesh/faramesh-values.yaml` — Helm chart values for sidecar deployment
+    - `faramesh/networkpolicy.yaml` — Kubernetes NetworkPolicy (recommended)
+
+    **Next steps**:
+    ```bash
+    kubectl create configmap faramesh-policy --from-file=faramesh/policy.yaml
+    helm install faramesh faramesh/faramesh-sidecar -f faramesh/faramesh-values.yaml
+    kubectl label deployment my-agent faramesh.io/inject=true
+    ```
+  </Accordion>
+
+  <Accordion title="AWS Lambda (A4 — Serverless Layer)">
+    **Detected when**: `AWS_LAMBDA_FUNCTION_NAME` environment variable is set
+
+    **Generated files**:
+    - `faramesh/policy.yaml` — Policy skeleton
+    - `faramesh/layer-config.json` — Lambda Layer ARN + environment variable template
+
+    **Next steps**:
+    ```bash
+    # Store policy in AWS SSM Parameter Store
+    aws ssm put-parameter --name /faramesh/policy --value file://faramesh/policy.yaml
+    
+    # Add Lambda layer and set environment variable
+    # FARAMESH_POLICY_SSM=/faramesh/policy
+    ```
+  </Accordion>
+
+  <Accordion title="MCP Server (A5 — MCP Gateway)">
+    **Detected when**: `MCP_SERVER` environment variable is set
+
+    **Reason**: MCP environment detected — Faramesh acts as an MCP gateway
+
+    **Next steps**: Configure your MCP client to connect through Faramesh.
+  </Accordion>
+
+  <Accordion title="Docker (A2 — Local Daemon + Docker Compose)">
+    **Detected when**: `docker` command is available
+
+    **Generated files**:
+    - `faramesh/policy.yaml` — Policy skeleton
+    - `faramesh/docker-compose.yml` — Compose snippet to add faramesh service
+
+    **Next steps**:
+    ```bash
+    faramesh run --policy faramesh/policy.yaml -- python agent.py
+    ```
+  </Accordion>
+
+  <Accordion title="Python/Node.js (A1 — SDK Shim)">
+    **Detected when**: No orchestration layer detected (default fallback)
+
+    **Generated files**:
+    - `faramesh/policy.yaml` — Policy skeleton
+
+    **Next steps**:
+    ```bash
+    # Python
+    pip install faramesh
+    ```
+
+    ```python
+    from faramesh import govern
+    governed_tool = govern(my_tool, policy='faramesh/policy.yaml')
+    ```
+
+    ```bash
+    # JavaScript/TypeScript
+    npm install faramesh
+    ```
+
+    ```javascript
+    import { govern } from 'faramesh';
+    const governedTool = govern(myTool, { policy: 'faramesh/policy.yaml' });
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Example Output
+
+### Kubernetes Environment
+
+```bash
+$ faramesh init
+
+Faramesh v1.0.0 — Unified Governance Plane
+Detecting your environment...
+
+  ✓ Detected: Python 3.11.5 agent
+  ✓ Detected: Kubernetes cluster (kubectl available)
+  ✓ Detected: Helm
+  ✓ Detected: Docker
+  ✗ AWS Lambda environment (optional)
+  ✗ MCP server (optional)
+  ✗ eBPF / CAP_BPF (Linux 5.8+ only) (optional)
+
+Recommended adapter: A3 (Sidecar + Transparent Proxy)
+Reason: Kubernetes environment detected; Helm available for one-command deployment
+
+Generating configuration...
+
+  faramesh/
+    policy.yaml           ← Policy file (edit this)
+    faramesh-values.yaml  ← Helm values for sidecar deployment
+    networkpolicy.yaml    ← K8s NetworkPolicy (recommended)
+
+Next steps:
+
+  1. Edit faramesh/policy.yaml
+  2. faramesh policy validate faramesh/policy.yaml
+  3. kubectl create configmap faramesh-policy --from-file=faramesh/policy.yaml
+  4. helm install faramesh faramesh/faramesh-sidecar -f faramesh/faramesh-values.yaml
+  5. kubectl label deployment my-agent faramesh.io/inject=true
+  6. faramesh audit tail
+
+Tip: Start in observation mode first:
+  faramesh serve --policy faramesh/policy.yaml
+
+Run the demo to see governance in action:
+  faramesh demo
+
+✓ Created faramesh/policy.yaml
+```
+
+### Local Python Environment
+
+```bash
+$ faramesh init
+
+Faramesh v1.0.0 — Unified Governance Plane
+Detecting your environment...
+
+  ✓ Detected: Python 3.11.5 agent
+  ✗ Node.js agent (optional)
+  ✗ Kubernetes cluster (kubectl available) (optional)
+  ✗ Helm (optional)
+  ✗ Docker (optional)
+  ✗ AWS Lambda environment (optional)
+  ✗ MCP server (optional)
+  ✗ eBPF / CAP_BPF (Linux 5.8+ only) (optional)
+
+Recommended adapter: A1 (SDK Shim — zero infrastructure)
+Reason: No orchestration layer detected; SDK shim is the fastest path to governance
+
+Generating configuration...
+
+  faramesh/
+    policy.yaml         ← Policy file (edit this)
+
+Next steps:
+
+  1. Edit faramesh/policy.yaml — add your governance rules
+  2. faramesh policy validate faramesh/policy.yaml
+  3. from faramesh import govern
+     governed_tool = govern(my_tool, policy='faramesh/policy.yaml')
+  4. faramesh audit tail
+
+Tip: Start in observation mode first:
+  faramesh serve --policy faramesh/policy.yaml
+
+Run the demo to see governance in action:
+  faramesh demo
+
+✓ Created faramesh/policy.yaml
+```
+
+## Generated Policy Skeleton
+
+The `faramesh/policy.yaml` file contains a starter policy:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: my-agent
+default_effect: permit
+
+vars:
+  max_refund: 500
+
+rules:
+  # Deny destructive shell commands.
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs"'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+
+  # Require approval for high-value operations.
+  - id: defer-high-value
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: high-value operation requires human approval
+    reason_code: HIGH_VALUE_THRESHOLD
+```
+
+<Note>
+The `init` command will **not** overwrite an existing `faramesh/policy.yaml` file.
+</Note>
+
+## Adapter Architecture
+
+Faramesh uses a **unified core + thin adapters** architecture:
+
+```
+┌──────────────────────── FARAMESH CORE ────────────────────────┐
+│  Policy Engine │ DPR Chain │ DEFER Workflow │ Session State   │
+└────────────────────────────┬──────────────────────────────────┘
+                             │ CanonicalActionRequest
+┌────────────────────────────▼──────────────────────────────────┐
+│  A1: SDK Shim          A2: Local Daemon       A3: Sidecar     │
+│  Python/JS/Go          Unix socket            Network proxy    │
+│                                                                 │
+│  A4: Serverless        A5: MCP Gateway        A6: eBPF         │
+│  Lambda/Cloud Run      Faramesh IS MCP        Kernel-level     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+The same policy works across all adapters — only the deployment mechanism changes.
+
+## Related Commands
+
+- [`faramesh demo`](/cli/demo) — See governance in action
+- [`faramesh serve`](/cli/serve) — Start the governance daemon
+- [`faramesh policy validate`](/cli/policy#validate) — Validate generated policy
+- [`faramesh audit tail`](/cli/audit#tail) — Stream live decisions

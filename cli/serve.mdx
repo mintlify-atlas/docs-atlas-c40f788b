@@ -1,0 +1,231 @@
+---
+title: faramesh serve
+description: Start the Faramesh governance daemon
+---
+
+## Overview
+
+`faramesh serve` starts the governance daemon. Agents connect via Unix socket to submit tool calls and receive PERMIT/DENY/DEFER decisions. The daemon loads your policy file, initializes the write-ahead log (WAL) and DPR store, and begins accepting connections.
+
+## Usage
+
+```bash
+faramesh serve --policy <policy-file> [flags]
+```
+
+## Flags
+
+<ParamField path="--policy" type="string" default="policy.yaml" required>
+  Path to the policy YAML file. This file defines your governance rules.
+</ParamField>
+
+<ParamField path="--data-dir" type="string" default="$TMPDIR/faramesh">
+  Directory for WAL and DPR SQLite database. Defaults to temporary directory.
+</ParamField>
+
+<ParamField path="--socket" type="string" default="/tmp/faramesh.sock">
+  Unix socket path for agent communication.
+</ParamField>
+
+<ParamField path="--slack-webhook" type="string">
+  Slack webhook URL for DEFER notifications. When set, DEFER decisions will trigger Slack messages with approval commands.
+</ParamField>
+
+<ParamField path="--log-level" type="string" default="info">
+  Log level. Options: `debug`, `info`, `warn`, `error`.
+</ParamField>
+
+<ParamField path="--sync-horizon" type="boolean" default="false">
+  Stream DPR records to Faramesh Horizon cloud. Requires authentication via `faramesh auth login`.
+</ParamField>
+
+## Examples
+
+### Basic Usage
+
+```bash
+faramesh serve --policy payment.yaml
+```
+
+Starts the daemon with the `payment.yaml` policy on the default socket.
+
+### Custom Data Directory
+
+```bash
+faramesh serve --policy policy.yaml --data-dir /var/lib/faramesh
+```
+
+Stores WAL and DPR database in `/var/lib/faramesh` for persistent audit records.
+
+### Slack Notifications for DEFER
+
+```bash
+faramesh serve \
+  --policy policy.yaml \
+  --slack-webhook https://hooks.slack.com/services/YOUR/WEBHOOK/URL
+```
+
+Sends Slack notifications when agents trigger DEFER decisions:
+
+```
+🟡 Action requires approval
+Agent: payment-bot
+Tool: stripe/refund
+Amount: $12,000
+
+Approve: faramesh agent approve def_abc123
+Deny: faramesh agent deny def_abc123
+```
+
+### Sync to Faramesh Horizon
+
+```bash
+faramesh auth login
+faramesh serve --policy policy.yaml --sync-horizon
+```
+
+Streams all DPR records to Faramesh Horizon for fleet management and compliance reporting.
+
+### Debug Mode
+
+```bash
+faramesh serve --policy policy.yaml --log-level debug
+```
+
+Enables verbose logging for policy debugging and troubleshooting.
+
+## What Happens on Startup
+
+### 1. Policy Loading
+
+- Loads and parses the YAML policy file
+- Validates rule structure and references
+- Compiles all `when` conditions to expr-lang bytecode
+- Fails fast if policy is invalid
+
+### 2. Storage Initialization
+
+- Opens write-ahead log (WAL) for durable decision recording
+- Creates or opens SQLite DPR database
+- Replays any uncommitted WAL entries from previous crash
+- Verifies DPR chain integrity
+
+### 3. Socket Listener
+
+- Creates Unix socket at specified path
+- Sets socket permissions (0600)
+- Begins accepting connections from SDK adapters
+
+### 4. Session Manager
+
+- Initializes in-memory session state tracker
+- Creates per-agent counters and history rings
+- Loads any persisted session data
+
+### 5. DEFER Workflow
+
+- Starts DEFER approval listener
+- Loads pending deferrals from disk
+- Configures timeout handlers (default: 5 minutes)
+
+## Daemon Architecture
+
+```
+┌─────────────────── faramesh serve ───────────────────┐
+│                                                       │
+│  ┌──────────────┐      ┌──────────────┐             │
+│  │ Unix Socket  │─────▶│   Pipeline   │             │
+│  │ /tmp/faramesh│      │              │             │
+│  │    .sock     │      │ • Kill switch│             │
+│  └──────────────┘      │ • Scanners   │             │
+│                        │ • Policy eval│             │
+│  ┌──────────────┐      │ • Session    │             │
+│  │ Policy File  │─────▶│ • WAL write  │──┐          │
+│  │  (YAML)      │      └──────────────┘  │          │
+│  └──────────────┘                        │          │
+│                                          ▼          │
+│  ┌──────────────┐      ┌──────────────────────┐    │
+│  │ Slack Webhook│◀─────│  DEFER Workflow      │    │
+│  └──────────────┘      └──────────────────────┘    │
+│                                          │          │
+│                                          ▼          │
+│                        ┌──────────────────────┐    │
+│                        │  DPR SQLite Store    │    │
+│                        └──────────────────────┘    │
+│                                          │          │
+│                                          ▼          │
+│  ┌──────────────┐      ┌──────────────────────┐    │
+│  │ Horizon API  │◀─────│  Horizon Sync        │    │
+│  │ (--sync-     │      │  (if authenticated)  │    │
+│  │  horizon)    │      └──────────────────────┘    │
+│  └──────────────┘                                   │
+└───────────────────────────────────────────────────┘
+```
+
+## WAL-First Decision Recording
+
+Every governance decision is written to the WAL **before** being returned to the agent:
+
+```
+CanonicalActionRequest
+ ├─ Kill switch check
+ ├─ Pre-execution scanners (shell, secret, PII)
+ ├─ Session state read
+ ├─ Policy evaluation
+ ├─ Decision: PERMIT | DENY | DEFER
+ ├─ WAL write ────────── fsync to disk BEFORE returning
+ └─ Return to agent
+
+   [Async]
+   └─ Replicate to SQLite DPR store
+   └─ Update session counters
+   └─ Sync to Horizon (if enabled)
+```
+
+If the WAL write fails, the decision is **DENY**. No execution without an audit record.
+
+## Signal Handling
+
+The daemon handles signals gracefully:
+
+- **SIGTERM / SIGINT**: Graceful shutdown
+  - Flushes WAL to disk
+  - Closes SQLite connections
+  - Removes Unix socket
+  - Waits for in-flight requests (up to 30s)
+
+- **SIGHUP**: Reload policy
+  - Reloads policy file
+  - Recompiles rules
+  - Atomically swaps policy engine
+  - No downtime
+
+## Horizon Sync
+
+When `--sync-horizon` is enabled:
+
+1. Daemon authenticates with stored Horizon credentials
+2. Opens gRPC stream to Horizon API
+3. Streams DPR records in batches (every 10 records or 5 seconds)
+4. Handles network failures with exponential backoff
+5. Local DPR is always authoritative — Horizon is eventual consistency
+
+<Note>
+Horizon sync requires authentication. Run `faramesh auth login` before using `--sync-horizon`.
+</Note>
+
+## Observability
+
+The daemon exposes:
+
+- **Structured logs** (JSON or text) to stdout
+- **Prometheus metrics** at `/metrics` (if enabled)
+- **Health check** at `/health`
+- **pprof endpoints** for profiling (if `--log-level debug`)
+
+## Related Commands
+
+- [`faramesh policy validate`](/cli/policy#validate) — Validate policy before serving
+- [`faramesh audit tail`](/cli/audit#tail) — Stream decisions from running daemon
+- [`faramesh auth login`](/cli/auth#login) — Authenticate for Horizon sync
+- [`faramesh agent approve`](/cli/agent#approve) — Approve pending DEFER actions

@@ -1,0 +1,363 @@
+---
+title: Policy Validation
+description: Validate, test, and debug Faramesh policies before deployment
+---
+
+Faramesh provides CLI tools to validate policy syntax, test rules, and diff policy versions before deployment.
+
+## faramesh policy validate
+
+Validate a policy file for syntax errors and compile-time issues:
+
+```bash
+faramesh policy validate policies/payment.yaml
+```
+
+### What It Checks
+
+<AccordionGroup>
+  <Accordion title="YAML Syntax" icon="code">
+    Parses the policy YAML and validates it against the FPL schema
+  </Accordion>
+  
+  <Accordion title="Rule Structure" icon="gavel">
+    Ensures all required fields are present:
+    - `id` — unique rule identifier
+    - `match` — match conditions
+    - `effect` — permit, deny, defer, or shadow
+  </Accordion>
+  
+  <Accordion title="Expression Compilation" icon="brackets-curly">
+    Compiles all `when` expressions with expr-lang:
+    - Syntax validation
+    - Type checking
+    - Variable reference validation
+  </Accordion>
+  
+  <Accordion title="Schema Validation" icon="check">
+    Validates policy against FPL version schema:
+    - Required fields present
+    - Valid effect values
+    - Tool metadata format
+  </Accordion>
+</AccordionGroup>
+
+### Success Output
+
+```bash
+$ faramesh policy validate policies/demo.yaml
+✓ policies/demo.yaml  [1.0]  4 rules  agent=demo-agent
+```
+
+### Error Output
+
+```bash
+$ faramesh policy validate policies/broken.yaml
+✗ parse error: yaml: line 12: mapping values are not allowed in this context
+```
+
+```bash
+$ faramesh policy validate policies/bad-expr.yaml
+✗ compilation error: rule defer-high-value: invalid syntax in when clause: unexpected token ">"
+```
+
+### Warnings
+
+The validator emits warnings for non-critical issues:
+
+```bash
+$ faramesh policy validate policies/demo.yaml
+⚠ rule permit-normal-refund: unreachable due to earlier catch-all rule
+✓ policies/demo.yaml  [1.0]  4 rules  agent=demo-agent  (1 warning(s))
+```
+
+Warnings don't cause validation to fail (exit code 0), but should be reviewed.
+
+## faramesh policy test
+
+Dry-run a governance decision without a running daemon:
+
+```bash
+faramesh policy test policies/payment.yaml \
+  --tool stripe/refund \
+  --args '{"amount":750}'
+```
+
+### Output
+
+```bash
+  Tool:    stripe/refund
+  Effect:  defer
+  Rule:    defer-high-value-refund
+  Reason:  refund exceeds threshold and requires finance approval
+  Code:    HIGH_VALUE_REFUND
+```
+
+### Testing Different Scenarios
+
+<CodeGroup>
+
+```bash High-value refund (should defer)
+faramesh policy test policies/payment.yaml \
+  --tool stripe/refund \
+  --args '{"amount":750}'
+```
+
+```bash Normal refund (should permit)
+faramesh policy test policies/payment.yaml \
+  --tool stripe/refund \
+  --args '{"amount":250}'
+```
+
+```bash Destructive shell (should deny)
+faramesh policy test policies/demo.yaml \
+  --tool shell/run \
+  --args '{"cmd":"rm -rf /data"}'
+```
+
+```bash Mass email (should deny)
+faramesh policy test policies/demo.yaml \
+  --tool send_email \
+  --args '{"recipients":["user1@example.com","user2@example.com","...(50 more)..."]}'
+```
+
+</CodeGroup>
+
+### JSON Output
+
+For programmatic use, request JSON output:
+
+```bash
+faramesh policy test policies/payment.yaml \
+  --tool stripe/refund \
+  --args '{"amount":750}' \
+  --json
+```
+
+```json
+{
+  "effect": "defer",
+  "rule_id": "defer-high-value-refund",
+  "reason": "refund exceeds threshold and requires finance approval",
+  "reason_code": "HIGH_VALUE_REFUND",
+  "incident_category": "financial_threshold",
+  "incident_severity": "high"
+}
+```
+
+## faramesh policy inspect
+
+Show a compiled policy summary:
+
+```bash
+faramesh policy inspect policies/demo.yaml
+```
+
+### Output
+
+```bash
+Policy: policies/demo.yaml
+  version    : 1.0
+  agent-id   : demo-agent
+  fpl        : 1.0
+  rules      : 4
+  tools      : 4 declared
+  default    : permit
+
+Rules:
+  deny      deny-destructive-shell           tool=shell/run  when="args[\"cmd\"] matches \"rm\\s+-[rf]\" ..."
+  defer     defer-high-value-refund          tool=stripe/refund  when="args[\"amount\"] > vars[\"max_refund\"]"
+  deny      deny-mass-email                  tool=send_email  when="len(args[\"recipients\"]) > vars[\"max_email_recipients\"]"
+  permit    permit-normal-refund             tool=stripe/refund  when="args[\"amount\"] <= vars[\"max_refund\"]"
+```
+
+## faramesh policy diff
+
+Compare two policy versions before deployment:
+
+```bash
+faramesh policy diff policies/v1.yaml policies/v2.yaml
+```
+
+### Output
+
+```bash
+Policy diff
+  old: policies/v1.yaml  [1.0]  3 rules
+  new: policies/v2.yaml  [1.0]  4 rules
+
+  + defer-high-value-refund          defer
+  ~ permit-normal-refund             permit → deny
+  - allow-all-http                   permit
+```
+
+Color-coded:
+- <span style={{color: 'green'}}>Green `+`</span> — Rule added
+- <span style={{color: 'yellow'}}>Yellow `~`</span> — Rule modified
+- <span style={{color: 'red'}}>Red `-`</span> — Rule removed
+
+## CI Integration
+
+Integrate policy validation into your CI pipeline:
+
+<CodeGroup>
+
+```yaml GitHub Actions
+name: Validate Policies
+
+on:
+  pull_request:
+    paths:
+      - 'policies/**'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Faramesh
+        run: |
+          curl -fsSL https://install.faramesh.com | sh
+      
+      - name: Validate all policies
+        run: |
+          for policy in policies/*.yaml; do
+            faramesh policy validate $policy
+          done
+      
+      - name: Test critical rules
+        run: |
+          faramesh policy test policies/payment.yaml \
+            --tool stripe/refund --args '{"amount":1000}' \
+            --json | jq -e '.effect == "defer"'
+```
+
+```yaml GitLab CI
+validate-policies:
+  stage: test
+  image: faramesh/cli:latest
+  script:
+    - faramesh policy validate policies/*.yaml
+    - faramesh policy diff policies/production.yaml policies/staging.yaml
+  only:
+    changes:
+      - policies/**
+```
+
+```groovy Jenkins
+pipeline {
+  agent any
+  
+  stages {
+    stage('Validate Policies') {
+      steps {
+        sh 'faramesh policy validate policies/*.yaml'
+      }
+    }
+    
+    stage('Test Rules') {
+      steps {
+        sh '''
+          faramesh policy test policies/payment.yaml \
+            --tool stripe/refund --args '{"amount":1000}'
+        '''
+      }
+    }
+  }
+}
+```
+
+</CodeGroup>
+
+## Pre-Deployment Checklist
+
+Before deploying a new policy:
+
+<Steps>
+  <Step title="Validate syntax">
+    ```bash
+    faramesh policy validate policies/new-policy.yaml
+    ```
+  </Step>
+  
+  <Step title="Test critical paths">
+    ```bash
+    # Test expected DEFER
+    faramesh policy test policies/new-policy.yaml \
+      --tool stripe/refund --args '{"amount":1000}'
+    
+    # Test expected PERMIT
+    faramesh policy test policies/new-policy.yaml \
+      --tool stripe/refund --args '{"amount":100}'
+    
+    # Test expected DENY
+    faramesh policy test policies/new-policy.yaml \
+      --tool shell/run --args '{"cmd":"rm -rf /"}'
+    ```
+  </Step>
+  
+  <Step title="Diff against production">
+    ```bash
+    faramesh policy diff policies/production.yaml policies/new-policy.yaml
+    ```
+  </Step>
+  
+  <Step title="Inspect compiled output">
+    ```bash
+    faramesh policy inspect policies/new-policy.yaml
+    ```
+  </Step>
+  
+  <Step title="Deploy to staging first">
+    Deploy to a staging environment and observe behavior before promoting to production.
+  </Step>
+</Steps>
+
+## Common Validation Errors
+
+### Missing Required Field
+
+```bash
+✗ rule defer-high-value: missing required field "effect"
+```
+
+**Fix**: Add the `effect` field to the rule.
+
+### Invalid Expression Syntax
+
+```bash
+✗ compilation error: rule defer-high-value: invalid syntax in when clause: unexpected token ">"
+```
+
+**Fix**: Check your `when` expression syntax. Common issues:
+- Missing quotes around string literals
+- Unescaped backslashes in regex: use `\\s` instead of `\s`
+- Invalid operators
+
+### Unknown Variable
+
+```bash
+✗ compilation error: rule defer-high-value: unknown variable "max_refund" in when clause
+```
+
+**Fix**: Add the variable to the `vars` section or access it via `vars["max_refund"]`.
+
+### Type Mismatch
+
+```bash
+✗ compilation error: rule deny-mass-email: cannot compare string to number
+```
+
+**Fix**: Ensure you're comparing compatible types. Use `len(args["recipients"])` to get array length as a number.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Policy Examples" icon="book" href="/policy/examples">
+    Complete policy examples for common use cases
+  </Card>
+  <Card title="Rules Reference" icon="gavel" href="/policy/rules">
+    Rule structure and match conditions
+  </Card>
+</CardGroup>

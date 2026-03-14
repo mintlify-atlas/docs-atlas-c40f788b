@@ -1,0 +1,176 @@
+---
+title: Policy Overview
+description: Introduction to Faramesh Policy Language (FPL) and policy-as-code governance
+---
+
+Faramesh Policy Language (FPL) enables declarative governance of AI agent behavior through YAML policy files. Policies are compiled to bytecode at load time and evaluated at ~1μs per rule, providing zero-latency governance for production agents.
+
+## Policy-as-Code Philosophy
+
+FPL treats governance as code:
+
+- **Version controlled**: Policies live in git alongside your application code
+- **Testable**: Validate and test policies in CI before deployment
+- **Auditable**: Every policy decision is logged with rule ID and reason
+- **Composable**: Build libraries of reusable policy rules
+
+## YAML Format with Expressions
+
+Policies are written in YAML with [expr-lang](https://expr-lang.org/) expressions for dynamic conditions:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: payment-agent
+
+rules:
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 500'
+    effect: defer
+    reason: refund exceeds threshold and requires finance approval
+```
+
+Expressions in `when` clauses are compiled at policy load time, ensuring runtime evaluation is fast and type-safe.
+
+## Policy Structure
+
+Every FPL policy contains:
+
+<ParamField path="faramesh-version" type="string" required>
+  FPL version (currently `1.0`)
+</ParamField>
+
+<ParamField path="agent-id" type="string" required>
+  Unique identifier for the agent this policy governs
+</ParamField>
+
+<ParamField path="vars" type="object">
+  Reusable variables accessible in rule expressions via `vars["key"]`
+</ParamField>
+
+<ParamField path="tools" type="object">
+  Tool metadata: reversibility, blast radius, shadow safety, cost
+</ParamField>
+
+<ParamField path="rules" type="array" required>
+  Ordered list of governance rules. First match wins.
+</ParamField>
+
+<ParamField path="default_effect" type="string" default="permit">
+  Effect when no rule matches: `permit` or `deny`
+</ParamField>
+
+<ParamField path="budget" type="object">
+  Cost and call limits enforced pre-execution
+</ParamField>
+
+## Four Effects
+
+Every rule produces one of four effects:
+
+<CodeGroup>
+
+```yaml PERMIT
+- id: allow-safe-http
+  match:
+    tool: http/get
+  effect: permit
+  reason: Safe read-only HTTP GET
+```
+
+```yaml DENY
+- id: deny-destructive-shell
+  match:
+    tool: shell/run
+    when: 'args["cmd"] matches "rm\\s+-[rf]"'
+  effect: deny
+  reason: destructive shell command blocked by policy
+  reason_code: DESTRUCTIVE_SHELL_COMMAND
+```
+
+```yaml DEFER
+- id: defer-high-value-refund
+  match:
+    tool: stripe/refund
+    when: 'args["amount"] > 500'
+  effect: defer
+  reason: refund exceeds threshold and requires finance approval
+  reason_code: HIGH_VALUE_REFUND
+```
+
+```yaml SHADOW
+- id: shadow-new-api
+  match:
+    tool: internal/new-api
+  effect: shadow
+  reason: observing new API before full rollout
+```
+
+</CodeGroup>
+
+<Note>
+  **DEFER** pauses execution and sends the request to a human approver. The agent waits for approval before proceeding.
+  
+  **SHADOW** allows the call but marks it as "shadow mode" — useful for observing behavior of new tools before full rollout.
+</Note>
+
+## Policy Schema Reference
+
+The complete policy schema is defined in `internal/core/policy/schema.go`. Key types:
+
+**Doc** — Top-level policy document structure  
+**Rule** — Individual governance rule with match conditions and effect  
+**Tool** — Tool metadata (reversibility, blast_radius, shadow_safe, cost_usd)  
+**Match** — Match conditions: tool pattern and when expression  
+**Budget** — Cost and call limits (daily_usd, session_usd, max_calls)
+
+See [Syntax Reference](/policy/syntax) for complete schema details.
+
+## First-Match-Wins Evaluation
+
+Rules are evaluated in **document order**. The first rule whose `match` conditions are satisfied determines the effect:
+
+```yaml
+rules:
+  # Rule 1: catches amounts > 500
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 500'
+    effect: defer
+    
+  # Rule 2: catches amounts <= 500
+  - id: permit-normal-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] <= 500'
+    effect: permit
+    
+  # Rule 3: default deny (never reached for stripe/refund)
+  - id: default-deny
+    match:
+      tool: "*"
+    effect: deny
+```
+
+<Warning>
+  Rule order matters. Always place more specific rules before general catch-all rules.
+</Warning>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Syntax Reference" icon="code" href="/policy/syntax">
+    Complete YAML schema specification
+  </Card>
+  <Card title="Rules Reference" icon="gavel" href="/policy/rules">
+    Rule structure and match conditions
+  </Card>
+  <Card title="Expressions" icon="brackets-curly" href="/policy/expressions">
+    expr-lang syntax and operators
+  </Card>
+  <Card title="Examples" icon="book" href="/policy/examples">
+    Complete policy examples for common use cases
+  </Card>
+</CardGroup>

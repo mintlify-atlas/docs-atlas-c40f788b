@@ -1,0 +1,290 @@
+---
+title: 'DPR Chain'
+description: 'Decision-Provenance Record chain: tamper-evident audit trail with per-agent hash chains'
+---
+
+## Overview
+
+Every governance decision is recorded in a **Decision-Provenance Record (DPR)** chain. Each record is cryptographically linked to the previous one using SHA256 hashes, forming a tamper-evident audit log per agent.
+
+<Info>
+**DPR Schema Version**: `dpr/1.0` — all records follow a flat JSON schema for efficient storage and verification.
+</Info>
+
+## Why DPR Chains?
+
+Traditional logs are mutable. An operator with database access can delete or modify entries. DPR chains solve this:
+
+✅ **Tamper-evident**: Any modification breaks the hash chain  
+✅ **Per-agent**: Each agent has its own chain (isolated blast radius)  
+✅ **Verifiable**: `faramesh audit verify` checks chain integrity in seconds  
+✅ **Flat schema**: Efficient SQLite storage and fast queries
+
+## Record Structure
+
+Each DPR record captures the governance decision and its context:
+
+```go internal/core/dpr/record.go:20
+type Record struct {
+    // ── Schema & Chain Integrity ──
+    SchemaVersion  string `json:"schema_version"`   // "dpr/1.0"
+    RecordID       string `json:"record_id"`        // UUID v4
+    PrevRecordHash string `json:"prev_record_hash"` // SHA256 of previous record
+    RecordHash     string `json:"record_hash"`      // SHA256 of this record
+
+    // ── Identity & Request ──
+    AgentID          string `json:"agent_id"`
+    SessionID        string `json:"session_id"`
+    ToolID           string `json:"tool_id"`
+    InterceptAdapter string `json:"intercept_adapter"` // "sdk", "proxy", "mcp", "ebpf"
+
+    // ── Decision ──
+    Effect        string `json:"effect"`          // PERMIT, DENY, DEFER, SHADOW
+    MatchedRuleID string `json:"matched_rule_id"` // First rule that matched
+    ReasonCode    string `json:"reason_code"`     // Machine-readable reason
+    Reason        string `json:"reason"`          // Human-readable explanation
+
+    // ── Policy Context ──
+    PolicyVersion     string `json:"policy_version"`      // Hash of active policy
+    ArgsStructuralSig string `json:"args_structural_sig"` // Shape hash (not raw values)
+
+    CreatedAt time.Time `json:"created_at"`
+}
+```
+
+See the full structure in `internal/core/dpr/record.go`.
+
+<Note>
+**Privacy by design**: Raw argument values are never stored. Only the structural signature (key names + types) is recorded.
+</Note>
+
+## Hash Chain Construction
+
+Each record's hash is computed from its canonical bytes, which include the previous record's hash:
+
+```go internal/core/dpr/record.go:99
+// CanonicalBytes returns the deterministic byte representation of this record
+// used to compute record_hash. The previous record's hash is included so the
+// chain forms a linked list of SHA256 hashes.
+func (r *Record) CanonicalBytes() []byte {
+    // Exclude record_hash and hmac_signature from the canonical form.
+    // Include prev_record_hash to link the chain.
+    canonicalJSON := json.Marshal(struct {
+        RecordID       string
+        PrevRecordHash string
+        AgentID        string
+        Effect         string
+        PolicyVersion  string
+        // ... all fields except record_hash and hmac_signature
+    })
+    return canonicalJSON
+}
+
+func (r *Record) ComputeHash() {
+    r.RecordHash = sha256(r.CanonicalBytes())
+}
+```
+
+The chain forms a linked list:
+
+```
+Genesis Record (prev_hash = deterministic seed)
+    ↓
+  SHA256
+    ↓
+Record 1 (prev_hash = genesis hash)
+    ↓
+  SHA256
+    ↓
+Record 2 (prev_hash = record 1 hash)
+    ↓
+  SHA256
+    ↓
+Record 3 (prev_hash = record 2 hash)
+```
+
+If **any** record is modified, its hash changes, which breaks the chain for all subsequent records.
+
+## Verification
+
+Verify chain integrity with:
+
+```bash
+faramesh audit verify ~/.faramesh/faramesh.db
+# ✓ Chain integrity verified. 1,247 records, 0 violations.
+```
+
+The verifier:
+1. Reads all records per agent from the SQLite store
+2. Recomputes each record's hash from its canonical bytes
+3. Checks that `record_hash` matches the recomputed hash
+4. Checks that `prev_record_hash` matches the previous record's `record_hash`
+5. Reports any violations
+
+<Warning>
+If verification fails, the audit trail has been tampered with. Faramesh will refuse to start until the chain is restored from a backup.
+</Warning>
+
+## Structural Signature (Privacy)
+
+Raw argument values are never stored in DPR records. Instead, we compute a **structural signature** that captures only the shape of the arguments:
+
+```go internal/core/dpr/record.go:160
+// ArgsSignature computes a structural signature of the args map.
+// Only the shape (key names and value types) is captured, never values.
+func ArgsSignature(args map[string]any) string {
+    sig := structuralSig(args, 0)
+    return sha256(sig)[:16]
+}
+
+func structuralSig(v any, depth int) string {
+    switch val := v.(type) {
+    case map[string]any:
+        parts := []
+        for k, child := range val {
+            parts.append(k + ":" + structuralSig(child, depth+1))
+        }
+        return "{" + join(parts) + "}"
+    case []any:
+        return "[" + structuralSig(val[0], depth+1) + "]"
+    case string:
+        return "string"
+    case float64:
+        return "number"
+    // ...
+    }
+}
+```
+
+### Example
+
+```json
+// Original args
+{
+  "amount": 12000,
+  "currency": "usd",
+  "customer": {
+    "id": "cust_abc123",
+    "tier": "enterprise"
+  }
+}
+
+// Structural signature
+{
+  "amount": "number",
+  "currency": "string",
+  "customer": {
+    "id": "string",
+    "tier": "string"
+  }
+}
+// Hash: e3b0c44298fc1c14
+```
+
+This allows:
+✅ Verification that the same argument structure was used  
+✅ Detection of schema drift over time  
+❌ No reconstruction of sensitive argument values
+
+<Info>
+**GDPR compliance**: The structural signature is GDPR-safe because it contains no personal data. Principal IDs are HMAC-hashed separately.
+</Info>
+
+## Storage Backends
+
+DPR records are stored in two places:
+
+### 1. Write-Ahead Log (WAL)
+
+Every record is written to the WAL **before** the decision is returned (see [WAL Ordering](/concepts/wal-ordering)). The WAL is newline-delimited JSON:
+
+```json
+{"record_id":"abc123","prev_record_hash":"def456",...}
+{"record_id":"xyz789","prev_record_hash":"abc123",...}
+```
+
+See `internal/core/dpr/wal.go`.
+
+### 2. SQLite Store
+
+Records are asynchronously replicated to SQLite for queryable long-term storage:
+
+```sql
+CREATE TABLE dpr_records (
+    record_id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    tool_id TEXT NOT NULL,
+    effect TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    record_hash TEXT NOT NULL,
+    prev_record_hash TEXT NOT NULL,
+    created_at DATETIME NOT NULL
+);
+
+CREATE INDEX idx_agent_created ON dpr_records(agent_id, created_at);
+```
+
+See `internal/core/dpr/sqlite.go`.
+
+<Note>
+PostgreSQL backend is also available for multi-agent fleet deployments. See `internal/core/dpr/postgres.go`.
+</Note>
+
+## Multi-Agent Linkage
+
+When one agent invokes another (orchestrator → worker), the DPR chain captures the linkage:
+
+```go internal/core/dpr/record.go:76
+// ── Multi-Agent Linkage ──
+InvokedByAgentID    string `json:"invoked_by_agent_id,omitempty"`
+InvokedByDPRID      string `json:"invoked_by_dpr_record_id,omitempty"`
+InnerGovernanceDPRID string `json:"inner_governance_dpr_record_id,omitempty"`
+```
+
+This allows:
+- Tracing delegation chains across agents
+- Verifying that sub-agents are authorized by parent agents
+- Reconstructing the full call graph for incident response
+
+## Querying the DPR Chain
+
+```bash
+# Stream live decisions
+faramesh audit tail
+
+# Query decisions for a specific agent
+faramesh audit query --agent-id payment-bot --since 1h
+
+# Export decisions for compliance
+faramesh audit export --format json --since 7d > audit.json
+```
+
+<CardGroup cols={2}>
+  <Card title="WAL Ordering" icon="database" href="/concepts/wal-ordering">
+    No execution without audit record
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    How DPR fits into the core
+  </Card>
+  <Card title="Policy Engine" icon="gavel" href="/concepts/policy-engine">
+    What gets recorded in DPR
+  </Card>
+  <Card title="DEFER Workflow" icon="clock" href="/concepts/defer-workflow">
+    DPR records for deferred actions
+  </Card>
+</CardGroup>
+
+## Incident Response
+
+DPR chains are designed for incident response:
+
+1. **Operator notices suspicious activity** → `faramesh audit tail`
+2. **Find the denial token** → `faramesh audit query --denial-token abc123`
+3. **Reconstruct the full session** → `faramesh audit query --session-id xyz`
+4. **Verify chain integrity** → `faramesh audit verify`
+5. **Export for compliance** → `faramesh audit export --format soc2`
+
+<Info>
+Denial tokens are opaque to agents but queryable by operators. This prevents oracle attacks where agents probe policy structure.
+</Info>

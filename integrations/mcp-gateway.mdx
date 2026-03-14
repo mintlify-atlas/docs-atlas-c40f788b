@@ -1,0 +1,401 @@
+---
+title: MCP Gateway
+description: Transparent governance for Model Context Protocol tools
+---
+
+The **A5 MCP Gateway** adapter provides transparent governance for [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers. It acts as a **governance proxy** between MCP clients (Claude Desktop, Cursor, etc.) and MCP tool servers — intercepting every tool call for pre-execution authorization.
+
+## Architecture
+
+```
+MCP Client ──► Faramesh MCP Gateway ──► Real MCP Server
+(Claude)       (governance here)        (tools)
+```
+
+The gateway:
+
+1. Implements the full MCP protocol (JSON-RPC 2.0)
+2. Intercepts `tools/call` messages
+3. Evaluates each call through the Faramesh pipeline
+4. Forwards **PERMIT** decisions to the real server
+5. Returns **DENY** as an MCP error (no forwarding)
+6. Returns **DEFER** as a "pending approval" response with a polling token
+
+## Quick Start
+
+### Wrap an Existing MCP Server
+
+If you have an MCP server running via stdio:
+
+```bash
+# Original MCP server command
+node mcp-server.js
+
+# Wrap with Faramesh governance
+faramesh mcp wrap --policy policy.yaml -- node mcp-server.js
+```
+
+Now configure your MCP client (Claude Desktop, Cursor, etc.) to use the wrapped command:
+
+```json claude_desktop_config.json
+{
+  "mcpServers": {
+    "my-server": {
+      "command": "faramesh",
+      "args": ["mcp", "wrap", "--policy", "policy.yaml", "--", "node", "mcp-server.js"]
+    }
+  }
+}
+```
+
+<Note>
+**One-line integration**: Change your MCP client config to prepend `faramesh mcp wrap --policy policy.yaml --` before the original server command. That's it.
+</Note>
+
+## HTTP Proxy Mode
+
+For MCP servers that use HTTP transport:
+
+```bash
+# Start HTTP gateway
+faramesh serve \
+  --policy policy.yaml \
+  --mcp-proxy-port 8090 \
+  --mcp-target http://localhost:3000
+```
+
+Configure your MCP client to connect to the gateway instead of the real server:
+
+```json
+{
+  "mcpServers": {
+    "my-server": {
+      "url": "http://localhost:8090"
+    }
+  }
+}
+```
+
+All `tools/call` requests are intercepted and governed. Other MCP messages (`initialize`, `tools/list`, `resources/read`, etc.) pass through unchanged.
+
+## Governance Flow
+
+### PERMIT
+
+```
+Client ──► Gateway: tools/call {name: "stripe_refund", arguments: {amount: 100}}
+           Gateway ──► Pipeline: PERMIT (policy allows small refunds)
+           Gateway ──► Server: tools/call {name: "stripe_refund", arguments: {amount: 100}}
+           Server ──► Gateway: {result: "Refunded $100"}
+Client ◄── Gateway: {result: "Refunded $100"}
+```
+
+### DENY
+
+```
+Client ──► Gateway: tools/call {name: "run_shell", arguments: {cmd: "rm -rf /"}}
+           Gateway ──► Pipeline: DENY (destructive command blocked)
+Client ◄── Gateway: MCP error {code: -32003, message: "Faramesh: tool call denied [DESTRUCTIVE_SHELL] ..."}
+```
+
+### DEFER
+
+```
+Client ──► Gateway: tools/call {name: "stripe_refund", arguments: {amount: 50000}}
+           Gateway ──► Pipeline: DEFER (high-value refund requires approval)
+Client ◄── Gateway: {result: {status: "pending_approval", defer_token: "defer_7a8b9c0d"}}
+
+# Operator approves:
+$ faramesh agent approve defer_7a8b9c0d
+
+# Client retries (or polls):
+Client ──► Gateway: tools/call {name: "stripe_refund", arguments: {amount: 50000}}
+           Gateway ──► Pipeline: PERMIT (approved)
+           Gateway ──► Server: tools/call ...
+Client ◄── Gateway: {result: "Refunded $50,000"}
+```
+
+## Configuration
+
+### Stdio Gateway
+
+```bash
+faramesh mcp wrap \
+  --policy policy.yaml \
+  --agent-id mcp-gateway \
+  --log-level info \
+  -- \
+  node mcp-server.js
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--policy` | `policy.yaml` | Path to policy file |
+| `--agent-id` | `mcp-gateway` | Agent identity for audit logs |
+| `--log-level` | `info` | Log verbosity |
+| `--` | (required) | Separator before server command |
+
+### HTTP Gateway
+
+```bash
+faramesh serve \
+  --policy policy.yaml \
+  --mcp-proxy-port 8090 \
+  --mcp-target http://localhost:3000 \
+  --agent-id mcp-http-gateway
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--mcp-proxy-port` | (none) | HTTP port for gateway |
+| `--mcp-target` | (required) | Upstream MCP server URL |
+| `--agent-id` | `mcp-gateway` | Agent identity |
+
+## MCP Message Types
+
+The gateway handles these MCP message types:
+
+| Message Type | Behavior |
+|--------------|----------|
+| `initialize` | Pass through (no governance) |
+| `tools/list` | Pass through (list available tools) |
+| `tools/call` | **Intercept and govern** |
+| `resources/list` | Pass through |
+| `resources/read` | Pass through |
+| `prompts/list` | Pass through |
+| `prompts/get` | Pass through |
+
+<Note>
+**Only `tools/call` is governed**. All other MCP operations pass through to the real server unchanged.
+</Note>
+
+## Policy Example
+
+```yaml mcp-policy.yaml
+faramesh-version: '1.0'
+agent-id: mcp-gateway
+default_effect: permit
+
+vars:
+  max_refund_auto: 1000
+
+rules:
+  # High-value refunds require approval
+  - id: defer-high-refund
+    match:
+      tool: stripe_refund
+      when: 'args["amount"] > vars["max_refund_auto"]'
+    effect: defer
+    reason: refund exceeds $1,000 threshold
+    reason_code: HIGH_VALUE_REFUND
+
+  # Block destructive shell commands
+  - id: deny-destructive-shell
+    match:
+      tool: run_shell
+      when: 'args["command"] matches "rm\\s+-[rf]|shutdown|reboot"'
+    effect: deny
+    reason: destructive command blocked
+    reason_code: DESTRUCTIVE_SHELL
+
+  # Limit database modifications
+  - id: deny-mass-delete
+    match:
+      tool: delete_records
+      when: 'len(args["ids"]) > 100'
+    effect: deny
+    reason: bulk delete requires manual review
+    reason_code: MASS_DELETE
+```
+
+## Client Configuration
+
+### Claude Desktop
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "faramesh",
+      "args": [
+        "mcp", "wrap",
+        "--policy", "/path/to/policy.yaml",
+        "--",
+        "npx", "-y", "@modelcontextprotocol/server-filesystem",
+        "/Users/you/Documents"
+      ]
+    },
+    "stripe": {
+      "command": "faramesh",
+      "args": [
+        "mcp", "wrap",
+        "--policy", "/path/to/stripe-policy.yaml",
+        "--",
+        "node", "stripe-mcp-server.js"
+      ]
+    }
+  }
+}
+```
+
+Restart Claude Desktop. All tool calls now flow through Faramesh.
+
+### Cursor
+
+Edit `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "my-tools": {
+      "command": "faramesh",
+      "args": ["mcp", "wrap", "--policy", "policy.yaml", "--", "python", "mcp_server.py"]
+    }
+  }
+}
+```
+
+### Custom MCP Client (Python)
+
+If you're building a custom MCP client:
+
+```python
+import subprocess
+import json
+
+# Start governed MCP server
+proc = subprocess.Popen(
+    [
+        'faramesh', 'mcp', 'wrap',
+        '--policy', 'policy.yaml',
+        '--',
+        'node', 'mcp-server.js'
+    ],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    text=True
+)
+
+# Send JSON-RPC request
+request = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+        "name": "stripe_refund",
+        "arguments": {"amount": 100, "currency": "usd"}
+    }
+}
+proc.stdin.write(json.dumps(request) + '\n')
+proc.stdin.flush()
+
+# Read response
+response_line = proc.stdout.readline()
+response = json.loads(response_line)
+print(response)
+```
+
+## Error Handling
+
+When a tool call is denied, the gateway returns a standard MCP error:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32003,
+    "message": "Faramesh: tool call denied [DESTRUCTIVE_SHELL] destructive command blocked",
+    "data": {
+      "rule_id": "deny-destructive-shell",
+      "reason_code": "DESTRUCTIVE_SHELL"
+    }
+  }
+}
+```
+
+MCP clients display this as a tool execution error.
+
+## Debugging
+
+### View Live Decisions
+
+```bash
+# In one terminal: start the gateway
+faramesh mcp wrap --policy policy.yaml -- node mcp-server.js
+
+# In another terminal: tail the audit log
+faramesh audit tail --follow
+```
+
+Output:
+```
+[10:15:32] PERMIT  stripe_refund      amount=100               latency=8ms
+[10:15:45] DEFER   stripe_refund      amount=50000             token=defer_7a8b9c0d
+[10:16:02] DENY    run_shell          command="rm -rf /"       rule=deny-destructive-shell
+```
+
+### Enable Debug Logging
+
+```bash
+faramesh mcp wrap \
+  --policy policy.yaml \
+  --log-level debug \
+  -- \
+  node mcp-server.js
+```
+
+## Advanced: Multi-Server Gateway
+
+Governor multiple MCP servers with a single policy:
+
+```bash
+# Terminal 1: Finance tools
+faramesh mcp wrap --policy finance.yaml --agent-id finance-mcp -- node finance-server.js
+
+# Terminal 2: Infra tools
+faramesh mcp wrap --policy infra.yaml --agent-id infra-mcp -- node infra-server.js
+```
+
+Configure Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "finance": {
+      "command": "faramesh",
+      "args": ["mcp", "wrap", "--policy", "finance.yaml", "--", "node", "finance-server.js"]
+    },
+    "infra": {
+      "command": "faramesh",
+      "args": ["mcp", "wrap", "--policy", "infra.yaml", "--", "node", "infra-server.js"]
+    }
+  }
+}
+```
+
+Each server has its own policy, budgets, and audit trail.
+
+## Limitations
+
+- **Stdio only blocks DEFER**: The gateway cannot block indefinitely waiting for approval (MCP clients expect quick responses). DEFER returns a pending status; clients must retry.
+- **HTTP mode supports long-polling**: Future versions will support WebSocket-based approval notifications.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Python SDK" icon="python" href="/integrations/python-sdk">
+    Govern Python agents directly
+  </Card>
+  <Card title="Policy Syntax" icon="file-code" href="/policy/syntax">
+    Write governance policies
+  </Card>
+  <Card title="Daemon Mode" icon="server" href="/integrations/daemon-mode">
+    Run Faramesh as a persistent service
+  </Card>
+  <Card title="Serverless" icon="bolt" href="/integrations/serverless">
+    Deploy in Lambda or Cloud Functions
+  </Card>
+</CardGroup>

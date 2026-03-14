@@ -1,0 +1,538 @@
+---
+title: Policy Examples
+description: Complete policy examples for common governance use cases in Faramesh
+---
+
+This page provides complete, production-ready policy examples extracted from the Faramesh repository.
+
+## Demo Policy (Complete)
+
+From `policies/demo.yaml` — a comprehensive policy demonstrating all core features:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: demo-agent
+default_effect: permit
+
+vars:
+  max_refund: 500
+  max_email_recipients: 50
+  allowed_domains:
+    - internal.example.com
+    - api.company.com
+
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial]
+  shell/run:
+    reversibility: irreversible
+    blast_radius: local
+    shadow_safe: false
+    tags: [system]
+  send_email:
+    reversibility: irreversible
+    blast_radius: external
+    shadow_safe: false
+    tags: [communication]
+  read_customer:
+    reversibility: read_only
+    blast_radius: none
+    tags: [pii_source]
+
+rules:
+  # Deny destructive shell commands before they run.
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs" || args["cmd"] matches "dd if="'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+    incident_category: destructive_command
+    incident_severity: critical
+
+  # Require human approval for high-value refunds.
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold and requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+    incident_category: financial_threshold
+    incident_severity: high
+
+  # Deny mass email operations without approval.
+  - id: deny-mass-email
+    match:
+      tool: send_email
+      when: 'len(args["recipients"]) > vars["max_email_recipients"]'
+    effect: deny
+    reason: mass email to more than 50 recipients requires manual review
+    reason_code: MASS_EMAIL_LIMIT
+    incident_category: mass_operation
+    incident_severity: medium
+
+  # Permit normal refunds under the threshold.
+  - id: permit-normal-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] <= vars["max_refund"]'
+    effect: permit
+    reason: refund within authorized threshold
+    reason_code: WITHIN_THRESHOLD
+```
+
+## Default Policy (Safe Starting Point)
+
+From `policies/default.yaml` — a conservative default-deny policy:
+
+```yaml
+faramesh-version: "1.0"
+agent-id: "default"
+
+tools:
+  http/get:
+    reversibility: reversible
+    blast_radius: low
+  http/post:
+    reversibility: reversible
+    blast_radius: medium
+  shell/exec:
+    reversibility: irreversible
+    blast_radius: high
+  stripe/refund:
+    reversibility: irreversible
+    blast_radius: high
+    tags: [financial]
+
+budget:
+  max_calls: 500
+  daily_usd: 10.00
+  on_exceed: deny
+
+rules:
+  # Allow safe read-only HTTP requests.
+  - id: allow-http-get
+    match:
+      tool: "http/get"
+    effect: permit
+    reason: "Safe read-only HTTP GET"
+
+  # Require human approval for any shell execution.
+  - id: defer-shell-exec
+    match:
+      tool: "shell/*"
+    effect: defer
+    reason: "Shell commands require human approval"
+    reason_code: RULE_DEFER_SHELL
+    incident_category: execution
+    incident_severity: high
+
+  # Require human approval for high-value financial operations.
+  - id: defer-stripe-high-value
+    match:
+      tool: "stripe/refund"
+      when: "args.amount > 500"
+    effect: defer
+    reason: "Refund over $500 requires human approval"
+    reason_code: RULE_DEFER_HIGH_VALUE
+
+  # Allow routine Stripe refunds under $500.
+  - id: allow-stripe-small-refund
+    match:
+      tool: "stripe/refund"
+      when: "args.amount <= 500"
+    effect: permit
+    reason: "Routine refund under $500"
+
+  # Deny all other actions (default deny).
+  - id: default-deny
+    match:
+      tool: "*"
+    effect: deny
+    reason: "No matching rule — default deny"
+    reason_code: DEFAULT_DENY
+
+default_effect: deny
+```
+
+## Payment & Refund Policy
+
+Governance for payment operations with tiered approval thresholds:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: payment-agent
+default_effect: deny
+
+vars:
+  tier1_max: 100    # auto-approve
+  tier2_max: 500    # finance approval
+  tier3_max: 5000   # director approval
+
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial]
+    cost_usd: 0.01
+  stripe/charge:
+    reversibility: compensatable
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial]
+    cost_usd: 0.01
+
+rules:
+  # Tier 1: Auto-approve small refunds
+  - id: permit-tier1-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] <= vars["tier1_max"]'
+    effect: permit
+    reason: small refund within tier 1 threshold
+    reason_code: TIER1_AUTO_APPROVED
+  
+  # Tier 2: Finance approval for medium refunds
+  - id: defer-tier2-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["tier1_max"] && args["amount"] <= vars["tier2_max"]'
+    effect: defer
+    reason: medium refund requires finance approval
+    reason_code: TIER2_FINANCE_APPROVAL
+    incident_severity: medium
+  
+  # Tier 3: Director approval for large refunds
+  - id: defer-tier3-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["tier2_max"] && args["amount"] <= vars["tier3_max"]'
+    effect: defer
+    reason: large refund requires director approval
+    reason_code: TIER3_DIRECTOR_APPROVAL
+    incident_severity: high
+  
+  # Deny extremely large refunds
+  - id: deny-excessive-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["tier3_max"]'
+    effect: deny
+    reason: refund exceeds maximum allowable threshold
+    reason_code: EXCESSIVE_REFUND
+    incident_severity: critical
+  
+  # Default deny
+  - id: default-deny
+    match:
+      tool: "*"
+    effect: deny
+    reason: no matching rule
+```
+
+## Shell Command Restrictions
+
+From `policies/packs/infra_shell_limits.yaml` — infrastructure automation policy:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: infra-agent
+default_effect: deny
+
+tools:
+  shell/run:
+    reversibility: irreversible
+    blast_radius: high
+    shadow_safe: false
+    tags: [system]
+
+rules:
+  # Block destructive commands completely
+  - id: deny-destructive-commands
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "shutdown" || args["cmd"] matches "reboot" || args["cmd"] matches "mkfs" || args["cmd"] matches "dd\\s+if="'
+    effect: deny
+    reason: destructive command blocked by policy
+    reason_code: DESTRUCTIVE_COMMAND
+    incident_category: destructive_command
+    incident_severity: critical
+  
+  # Require approval for system modifications
+  - id: defer-system-modifications
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "apt\\s+install" || args["cmd"] matches "yum\\s+install" || args["cmd"] matches "pip\\s+install" || args["cmd"] matches "systemctl" || args["cmd"] matches "service"'
+    effect: defer
+    reason: system modification requires approval
+    reason_code: SYSTEM_MODIFICATION
+    incident_severity: medium
+  
+  # Allow safe read-only commands
+  - id: permit-readonly-commands
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "^(ls|cat|grep|find|ps|df|free|uptime|date|echo)\\s"'
+    effect: permit
+    reason: safe read-only command
+    reason_code: READONLY_PERMITTED
+  
+  # Defer other shell commands
+  - id: defer-unknown-shell
+    match:
+      tool: shell/run
+    effect: defer
+    reason: unknown shell command requires approval
+    reason_code: UNKNOWN_SHELL_COMMAND
+```
+
+## Email Sending Limits
+
+Protect against mass email operations:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: email-agent
+default_effect: permit
+
+vars:
+  max_recipients: 50
+  max_daily_emails: 500
+  internal_domains:
+    - example.com
+    - company.com
+
+tools:
+  send_email:
+    reversibility: irreversible
+    blast_radius: external
+    shadow_safe: false
+    tags: [communication]
+    cost_usd: 0.001
+
+budget:
+  max_calls: 500
+  daily_usd: 1.00
+  on_exceed: defer
+
+rules:
+  # Deny mass email (>50 recipients)
+  - id: deny-mass-email
+    match:
+      tool: send_email
+      when: 'len(args["recipients"]) > vars["max_recipients"]'
+    effect: deny
+    reason: mass email exceeds recipient limit
+    reason_code: MASS_EMAIL_BLOCKED
+    incident_category: mass_operation
+    incident_severity: high
+  
+  # Require approval for external emails
+  - id: defer-external-email
+    match:
+      tool: send_email
+      when: '!(args["domain"] in vars["internal_domains"])'
+    effect: defer
+    reason: external email requires approval
+    reason_code: EXTERNAL_EMAIL
+    incident_severity: medium
+  
+  # Permit internal emails
+  - id: permit-internal-email
+    match:
+      tool: send_email
+      when: 'args["domain"] in vars["internal_domains"]'
+    effect: permit
+    reason: internal email permitted
+```
+
+## PII Access Controls
+
+Governance for accessing personally identifiable information:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: customer-support-agent
+default_effect: defer
+
+vars:
+  pii_fields:
+    - ssn
+    - credit_card
+    - bank_account
+  sensitive_fields:
+    - email
+    - phone
+    - address
+
+tools:
+  read_customer:
+    reversibility: read_only
+    blast_radius: none
+    tags: [pii_source]
+  update_customer:
+    reversibility: compensatable
+    blast_radius: external
+    tags: [pii_mutation]
+
+rules:
+  # Deny access to highly sensitive PII
+  - id: deny-pii-access
+    match:
+      tool: read_customer
+      when: 'args["field"] in vars["pii_fields"]'
+    effect: deny
+    reason: access to PII fields requires manual review
+    reason_code: PII_ACCESS_DENIED
+    incident_category: pii_access
+    incident_severity: critical
+  
+  # Defer access to sensitive fields
+  - id: defer-sensitive-access
+    match:
+      tool: read_customer
+      when: 'args["field"] in vars["sensitive_fields"]'
+    effect: defer
+    reason: sensitive field access requires approval
+    reason_code: SENSITIVE_FIELD_ACCESS
+    incident_severity: high
+  
+  # Permit access to non-sensitive fields
+  - id: permit-nonsensitive-access
+    match:
+      tool: read_customer
+      when: '!(args["field"] in vars["pii_fields"]) && !(args["field"] in vars["sensitive_fields"])'
+    effect: permit
+    reason: non-sensitive field access permitted
+  
+  # Defer all customer updates
+  - id: defer-customer-update
+    match:
+      tool: update_customer
+    effect: defer
+    reason: customer updates require approval
+    reason_code: CUSTOMER_UPDATE
+```
+
+## Sequence Enforcement (Exfiltration Detection)
+
+From `policies/examples/sequence_enforcement.yaml` — detecting multi-step attack patterns:
+
+```yaml
+faramesh-version: "1.0"
+agent-id: exfil-monitor
+
+rules:
+  # DATA EXFILTRATION PATTERN
+  # If data was sent to an external endpoint in the last 2 minutes,
+  # defer any subsequent delete operation.
+  - id: defer-delete-after-exfil
+    match:
+      tool: "delete_*"
+      when: "history_contains_within('http/post', 120)"
+    effect: defer
+    reason: "Delete blocked: data was sent to external endpoint in the last 2 minutes"
+    reason_code: SEQUENCE_EXFIL_DETECTED
+    incident_category: data_exfiltration
+    incident_severity: high
+
+  # CREDENTIAL ACCESS → OUTBOUND SEQUENCE
+  - id: defer-http-after-secret-access
+    match:
+      tool: "http/*"
+      when: "history_contains_within('secrets/*', 300) || history_contains_within('vault/*', 300)"
+    effect: defer
+    reason: "Outbound HTTP blocked: credential access occurred in this session"
+    reason_code: SEQUENCE_SECRET_LEAK_RISK
+
+  # READ → SHELL → OUTBOUND FULL SEQUENCE
+  - id: deny-shell-in-exfil-sequence
+    match:
+      tool: "shell/*"
+      when: "history_sequence('read_file', 'http/post')"
+    effect: deny
+    reason: "Shell execution denied: session exhibits read-then-exfil pattern"
+    reason_code: SEQUENCE_TRAJECTORY_DANGEROUS
+
+  # RATE ANOMALY: too many stripe calls in one session
+  - id: defer-stripe-burst
+    match:
+      tool: "stripe/*"
+      when: "history_tool_count('stripe/*') >= 5"
+    effect: defer
+    reason: "Stripe call rate anomaly: more than 5 calls in current session"
+    reason_code: SEQUENCE_RATE_ANOMALY
+
+  # Default: permit everything not caught above
+  - id: default-permit
+    match:
+      tool: "*"
+    effect: permit
+    reason: "Permitted by default"
+
+default_effect: deny
+```
+
+## Budget Enforcement
+
+Cost limits with DEFER escalation:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: api-agent
+default_effect: permit
+
+tools:
+  openai/completion:
+    reversibility: read_only
+    blast_radius: external
+    cost_usd: 0.02
+  anthropic/completion:
+    reversibility: read_only
+    blast_radius: external
+    cost_usd: 0.015
+  google/search:
+    reversibility: read_only
+    blast_radius: external
+    cost_usd: 0.005
+
+budget:
+  session_usd: 5.00      # max $5 per session
+  daily_usd: 50.00       # max $50 per day
+  max_calls: 1000        # max 1000 calls per session
+  on_exceed: defer       # require approval when limits hit
+
+rules:
+  # Defer expensive operations near budget limit
+  - id: defer-near-budget-limit
+    match:
+      tool: "*"
+      when: 'session.cost_usd > 4.50 && tool.cost_usd > 0.01'
+    effect: defer
+    reason: session approaching budget limit, expensive operation deferred
+    reason_code: NEAR_BUDGET_LIMIT
+  
+  # Permit normal operations
+  - id: permit-normal-operations
+    match:
+      tool: "*"
+    effect: permit
+    reason: within budget limits
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Validation" icon="check" href="/policy/validation">
+    Validate and test your policies
+  </Card>
+  <Card title="Expressions" icon="brackets-curly" href="/policy/expressions">
+    Learn expr-lang syntax
+  </Card>
+</CardGroup>

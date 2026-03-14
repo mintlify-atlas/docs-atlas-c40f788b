@@ -1,0 +1,302 @@
+---
+title: 'DEFER Workflow'
+description: 'Human-in-the-loop approval: park, poll, approve/deny'
+---
+
+## Overview
+
+The **DEFER** effect implements human-in-the-loop approval for high-stakes actions. When a policy rule evaluates to DEFER, the SDK blocks the agent's execution, registers a pending approval, and polls until a human operator approves or denies the action.
+
+<Info>
+**Default timeout**: DEFER'd actions auto-expire after 5 minutes if not resolved. This prevents indefinite blocking.
+</Info>
+
+## How DEFER Works
+
+```
+Agent calls governed_refund(amount=12000)
+  ↓
+Policy evaluates: amount > max_refund → DEFER
+  ↓
+SDK blocks (DeferPollLoop, polls every 2s)
+  ↓
+Slack notification: "Approve: faramesh agent approve abc12345"
+  ↓
+Operator runs: faramesh agent approve abc12345
+  ↓
+SDK unblocks, function executes
+```
+
+## Policy Example
+
+```yaml policies/demo.yaml:49
+rules:
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold and requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+```
+
+When this rule matches, the SDK receives a Decision with `Effect == DEFER` and a `DeferToken`.
+
+## SDK Behavior
+
+The SDK blocks the caller and enters a poll loop:
+
+```python
+try:
+    result = governed_refund(amount=12000, currency='usd')
+except DeferredError as e:
+    print(f"DEFER: {e.reason}")
+    print(f"Token: {e.defer_token}")
+    print(f"Approve with: faramesh agent approve {e.defer_token}")
+    # SDK polls every 2 seconds until resolved or expired
+```
+
+The SDK polls `check_approval(defer_token)` every 2 seconds until:
+- **Approved** → SDK unblocks, function executes
+- **Denied** → SDK raises `DenyError`
+- **Expired** → SDK raises `DeferredError(expired=True)`
+
+<Note>
+**Non-blocking mode**: Use `governed_refund.defer_nonblocking=True` to return immediately with the defer token instead of blocking.
+</Note>
+
+## DeferToken Structure
+
+The defer token is deterministically generated from the call context:
+
+```go internal/core/pipeline.go:278
+// Generate deterministic token from call ID — single Defer() call (no double-registration).
+token := sha256(req.CallID + req.ToolID)[:8]
+
+// Register with the DEFER workflow exactly once.
+handle, err := p.defers.DeferWithToken(token, req.AgentID, req.ToolID, reason)
+```
+
+This ensures:
+✅ **Idempotent**: Multiple evaluations of the same request use the same token  
+✅ **Opaque**: Tokens don't expose policy structure  
+✅ **Queryable**: Operators can look up pending approvals by token
+
+## DEFER Handle Structure
+
+The workflow manager tracks pending DEFERs:
+
+```go internal/core/defer/workflow.go:28
+type Handle struct {
+    Token     string
+    AgentID   string
+    ToolID    string
+    Reason    string
+    CreatedAt time.Time
+    Deadline  time.Time
+    ch        chan Resolution
+}
+```
+
+Each handle has:
+- **Token**: Opaque identifier
+- **Deadline**: When the DEFER auto-expires (default 5 minutes)
+- **Channel**: Go channel for signaling approval/denial
+
+See `internal/core/defer/workflow.go`.
+
+## Approval Commands
+
+### Approve
+
+```bash
+faramesh agent approve abc12345
+# ✓ Approved. Agent will proceed with action.
+```
+
+### Deny
+
+```bash
+faramesh agent deny abc12345
+# ✓ Denied. Agent will not proceed with action.
+```
+
+### Conditional Approval (Modified Args)
+
+Operators can approve with modified arguments:
+
+```bash
+faramesh agent approve abc12345 --modify-args '{"amount": 500}'
+# ✓ Approved with modified args. Agent will re-validate and proceed.
+```
+
+The modified args are re-evaluated against the policy before execution.
+
+<Warning>
+Conditional approval with modified args requires re-evaluation. If the modified args still trigger DEFER, the action remains blocked.
+</Warning>
+
+## Workflow Manager
+
+The DEFER workflow manager is implemented in `internal/core/defer/workflow.go`:
+
+```go internal/core/defer/workflow.go:54
+type Workflow struct {
+    mu       sync.Mutex
+    pending  map[string]*Handle         // token -> handle
+    resolved map[string]*resolvedHandle // token -> resolution (last N)
+    slackURL string
+}
+
+// DeferWithToken creates a new deferred handle with a specific token.
+// If a handle with this token already exists, the existing handle is returned.
+func (w *Workflow) DeferWithToken(token, agentID, toolID, reason string) (*Handle, error) {
+    // ... (see source)
+}
+
+// Resolve approves or denies a pending DEFER by its token.
+func (w *Workflow) Resolve(token string, approved bool, reason string) error {
+    // ... (see source)
+}
+```
+
+## Timeout Handling
+
+Each DEFER handle spawns a timeout goroutine:
+
+```go internal/core/defer/workflow.go:95
+go func() {
+    select {
+    case <-time.After(time.Until(h.Deadline)):
+        res := Resolution{Approved: false, Reason: "expired", Status: StatusExpired}
+        w.mu.Lock()
+        delete(w.pending, token)
+        w.resolved[token] = &resolvedHandle{resolution: res}
+        w.mu.Unlock()
+        select {
+        case h.ch <- res:
+        default:
+        }
+    case <-h.ch:
+    }
+}()
+```
+
+When the deadline passes:
+1. The handle is moved from `pending` to `resolved` with status `expired`
+2. The SDK poll loop receives the expiration event
+3. The SDK raises `DeferredError(expired=True)`
+
+<Info>
+Expired DEFERs are logged but not retried. If the agent wants to retry, it must call the tool again, triggering a fresh DEFER.
+</Info>
+
+## Notification Channels
+
+### Slack
+
+Configure Slack webhooks in the policy:
+
+```yaml
+webhooks:
+  url: https://hooks.slack.com/services/YOUR/WEBHOOK/URL
+  events:
+    - defer
+  secret: your-hmac-secret
+  timeout_ms: 5000
+```
+
+When a DEFER is registered, Faramesh sends a Slack message:
+
+```go internal/core/defer/workflow.go:229
+func (w *Workflow) notifySlack(h *Handle) {
+    msg := map[string]any{
+        "text": fmt.Sprintf(
+            "*Faramesh DEFER* | Agent: `%s` | Tool: `%s`\n>%s\n\nToken: `%s`\n\nApprove: `faramesh agent approve %s`\nDeny:    `faramesh agent deny %s`",
+            h.AgentID, h.ToolID, h.Reason, h.Token, h.Token, h.Token,
+        ),
+    }
+    body, _ := json.Marshal(msg)
+    resp, err := http.Post(w.slackURL, "application/json", bytes.NewReader(body))
+}
+```
+
+### PagerDuty
+
+For critical DEFERs, integrate with PagerDuty:
+
+```yaml
+defer_priority:
+  critical:
+    criteria: 'tool.blast_radius == "external" && args["amount"] > 10000'
+    sla_seconds: 300
+    channel: pagerduty
+    escalation_after_seconds: 120
+```
+
+### Terminal
+
+In development, pending DEFERs appear in `faramesh audit tail`:
+
+```bash
+faramesh audit tail
+# [10:00:20] DEFER   stripe/refund   amount=$12,000   token=abc12345
+#            Approve: faramesh agent approve abc12345
+```
+
+## Querying Pending DEFERs
+
+```bash
+# List all pending DEFERs
+faramesh agent pending
+
+# Output:
+# Token      Agent        Tool            Reason                          Expires At
+# abc12345   payment-bot  stripe/refund   exceeds threshold              10:05:20
+# def67890   email-bot    send_email      mass email requires approval   10:08:45
+```
+
+<CardGroup cols={2}>
+  <Card title="Policy Engine" icon="gavel" href="/concepts/policy-engine">
+    How to write DEFER rules
+  </Card>
+  <Card title="DPR Chain" icon="link" href="/concepts/dpr-chain">
+    DEFER decisions are recorded
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    DEFER workflow in the core
+  </Card>
+  <Card title="WAL Ordering" icon="database" href="/concepts/wal-ordering">
+    DEFER records in the WAL
+  </Card>
+</CardGroup>
+
+## Batch Approval
+
+Approve multiple DEFERs at once:
+
+```bash
+faramesh agent approve --batch abc12345,def67890,ghi11223
+# ✓ Approved 3 pending actions.
+```
+
+Batch approval is recorded in the DPR chain:
+
+```go internal/core/dpr/record.go:88
+// ── Batch Approval ──
+BatchApproval    bool     `json:"batch_approval,omitempty"`
+BatchSize        int      `json:"batch_size,omitempty"`
+BatchDPRIDs      []string `json:"batch_dpr_ids,omitempty"`
+```
+
+## Best Practices
+
+✅ **Set appropriate timeouts**: Match timeout to SLA (e.g., finance approval within 5 minutes)  
+✅ **Use notification channels**: Slack/PagerDuty ensure humans are notified  
+✅ **Log all DEFERs**: Even approved DEFERs should be reviewed in retrospectives  
+✅ **Test DEFER paths**: Unit test your agent's handling of `DeferredError`  
+❌ **Don't use DEFER for read-only operations**: DEFER is for high-stakes writes, not reads
+
+<Warning>
+DEFER adds latency (polling every 2 seconds). Use DEFER only for operations where human judgment is required.
+</Warning>

@@ -1,0 +1,284 @@
+---
+title: faramesh agent
+description: Fleet management commands - approve/deny deferred actions and activate kill switches
+---
+
+## Overview
+
+The `faramesh agent` command group provides fleet management operations: approve or deny pending DEFER actions and activate emergency kill switches for runaway agents.
+
+## Subcommands
+
+### approve
+
+Approve a pending DEFER action.
+
+```bash
+faramesh agent approve <defer-token> [flags]
+```
+
+#### Arguments
+
+<ParamField path="defer-token" type="string" required>
+  The DEFER token from the agent SDK or Slack notification.
+</ParamField>
+
+#### Flags
+
+<ParamField path="--socket" type="string" default="/tmp/faramesh.sock">
+  Daemon Unix socket path.
+</ParamField>
+
+#### Example
+
+**Scenario**: An agent requests a high-value refund that triggers DEFER:
+
+```python
+# Agent code
+try:
+    result = governed_refund(amount=12000, currency='usd')
+except DeferredError as e:
+    print(f"DEFER: {e.reason}")
+    print(f"Token: {e.defer_token}")
+    # Agent blocks here, polling for approval
+```
+
+**Output**:
+```
+DEFER: refund exceeds threshold — requires finance approval
+Token: def_abc123xyz
+```
+
+**Slack notification** (if `--slack-webhook` configured):
+```
+🟡 Action requires approval
+Agent: payment-bot
+Tool: stripe/refund
+Amount: $12,000
+
+Approve: faramesh agent approve def_abc123xyz
+Deny: faramesh agent deny def_abc123xyz
+```
+
+**Operator approval**:
+```bash
+$ faramesh agent approve def_abc123xyz
+✓ DEFER token def_abc123xyz approved
+```
+
+**Agent resumes**:
+```python
+# Agent unblocks and executes the refund
+result = {'id': 'ref_xyz', 'status': 'succeeded'}
+```
+
+#### What Happens
+
+1. Operator runs `faramesh agent approve <token>`
+2. Daemon validates the token exists and is pending
+3. Daemon writes approval decision to DPR chain
+4. Daemon signals the waiting agent via DEFER channel
+5. Agent SDK unblocks and executes the original function
+6. Result is returned to agent
+
+---
+
+### deny
+
+Deny a pending DEFER action.
+
+```bash
+faramesh agent deny <defer-token> [flags]
+```
+
+#### Arguments
+
+<ParamField path="defer-token" type="string" required>
+  The DEFER token from the agent SDK or Slack notification.
+</ParamField>
+
+#### Flags
+
+<ParamField path="--socket" type="string" default="/tmp/faramesh.sock">
+  Daemon Unix socket path.
+</ParamField>
+
+#### Example
+
+**Operator denial**:
+```bash
+$ faramesh agent deny def_abc123xyz
+✓ DEFER token def_abc123xyz denied
+```
+
+**Agent receives DenyError**:
+```python
+# Agent code
+try:
+    result = governed_refund(amount=12000, currency='usd')
+except DenyError as e:
+    print(f"DENY: {e.reason}")  # "Denied by operator"
+    # Function never executes
+```
+
+#### What Happens
+
+1. Operator runs `faramesh agent deny <token>`
+2. Daemon validates the token exists and is pending
+3. Daemon writes denial decision to DPR chain
+4. Daemon signals the waiting agent with denial
+5. Agent SDK raises `DenyError`
+6. Function never executes
+
+---
+
+### kill
+
+Activate kill switch for an agent — all subsequent calls will DENY.
+
+```bash
+faramesh agent kill <agent-id> [flags]
+```
+
+#### Arguments
+
+<ParamField path="agent-id" type="string" required>
+  The agent ID to kill. This should match the `agent_id` in your policy or SDK configuration.
+</ParamField>
+
+#### Flags
+
+<ParamField path="--socket" type="string" default="/tmp/faramesh.sock">
+  Daemon Unix socket path.
+</ParamField>
+
+#### Example
+
+**Scenario**: An agent is behaving erratically and needs immediate shutdown:
+
+```bash
+$ faramesh agent kill payment-bot
+⚡ Kill switch activated for agent: payment-bot
+All subsequent calls from this agent will be DENIED.
+```
+
+**Agent behavior after kill switch**:
+
+```python
+# Every tool call returns DENY
+try:
+    result = governed_refund(amount=100, currency='usd')
+except DenyError as e:
+    print(f"DENY: {e.reason}")  # "Kill switch activated"
+```
+
+#### What Happens
+
+1. Operator runs `faramesh agent kill <agent-id>`
+2. Daemon sets an atomic flag for this agent ID
+3. All future requests from this agent return **DENY** immediately
+4. Kill switch check happens **before** policy evaluation (nanoseconds)
+5. Agent cannot bypass kill switch via policy changes
+
+<Warning>
+**Kill switch is permanent for the daemon session.** Restart the daemon to clear kill switches.
+</Warning>
+
+#### Use Cases
+
+- **Runaway agents**: Stop an agent making excessive API calls
+- **Security incident**: Immediately cut off compromised agent
+- **Emergency stop**: Kill switch during an active incident
+- **Maintenance**: Gracefully disable agent without code changes
+
+---
+
+## DEFER Workflow
+
+### Complete Flow
+
+```
+1. Agent calls governed function
+   ↓
+2. Policy evaluates → DEFER
+   ↓
+3. Daemon writes DEFER to DPR
+   ↓
+4. Daemon parks request in DEFER channel
+   ↓
+5. Agent SDK blocks (polls every 2s)
+   ↓
+6. [Optional] Slack notification sent
+   ↓
+7. Operator runs: faramesh agent approve <token>
+   ↓
+8. Daemon writes approval to DPR
+   ↓
+9. Daemon signals DEFER channel
+   ↓
+10. Agent SDK unblocks
+    ↓
+11. Function executes
+    ↓
+12. Result returned to agent
+```
+
+### Timeout Behavior
+
+DEFER requests timeout after **5 minutes** (configurable):
+
+```python
+try:
+    result = governed_refund(amount=12000)
+except DeferredError as e:
+    if e.expired:
+        print("DEFER expired — no approval within timeout")
+    else:
+        print(f"DEFER: {e.reason}")
+```
+
+### Polling Interval
+
+The SDK polls the daemon every **2 seconds** while waiting for approval. This is transparent to the agent — the function call appears to block.
+
+---
+
+## DPR Records for Approvals
+
+Every approval/denial creates a DPR record:
+
+```json
+{
+  "record_id": "dpr_approval_001",
+  "event_type": "DEFER_APPROVED",
+  "defer_token": "def_abc123xyz",
+  "operator": "alice@company.com",
+  "timestamp": "2026-03-14T10:05:00Z",
+  "original_request": "dpr_request_123"
+}
+```
+
+This creates a complete audit trail: original DEFER decision → approval/denial → final execution.
+
+---
+
+## Fleet Management at Scale
+
+<Note>
+Advanced fleet management features are available via [Faramesh Horizon](/advanced/cloud-platform):
+
+- Web dashboard for DEFER approvals
+- Role-based approval workflows
+- Bulk approval/denial
+- Kill switch management UI
+- Agent health monitoring
+- Cross-org agent policies
+</Note>
+
+---
+
+## Related Commands
+
+- [`faramesh serve`](/cli/serve) — Start daemon to handle DEFER workflow
+- [`faramesh audit tail`](/cli/audit#tail) — Watch DEFER decisions in real-time
+- [`faramesh policy test`](/cli/policy#test) — Test DEFER rules before deployment

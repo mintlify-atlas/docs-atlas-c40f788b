@@ -1,97 +1,87 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Unified Governance Plane for AI Agents"
+description: "Pre-execution authorization, policy-as-code, and tamper-evident audit trail for AI agents"
 ---
 
-## Setting up
+<div className="text-center mb-8">
+  <p className="text-lg text-gray-400 max-w-3xl mx-auto">
+    One binary. One policy language. One DPR chain. Every environment.
+  </p>
+</div>
 
-Get your documentation site up and running in minutes.
+## See it work in 30 seconds
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+```bash
+# macOS / Linux with Homebrew
+brew install faramesh/tap/faramesh
 
-## Make it yours
+# or: curl -fsSL https://raw.githubusercontent.com/faramesh/faramesh-core/main/install.sh | sh
 
-Design a docs site that looks great and empowers your users.
+faramesh demo
+```
 
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<Note>
+Zero config. Zero infrastructure. PERMIT/DENY/DEFER decisions in under 3 seconds.
+</Note>
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Pre-execution Policy Enforcement" icon="shield-halved" href="/concepts/policy-engine">
+    PERMIT/DENY/DEFER decisions before any action executes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Policy-as-Code" icon="file-code" href="/policy/overview">
+    YAML policies with expr-lang expressions — validate in CI
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Tamper-Evident Audit Chain" icon="link" href="/concepts/dpr-chain">
+    Every decision recorded in a cryptographic DPR chain
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Human-in-the-Loop DEFER" icon="user-check" href="/concepts/defer-workflow">
+    Pause execution for approval on high-risk actions
   </Card>
-</Columns>
+  <Card title="Six Deployment Adapters" icon="plug" href="/concepts/adapters">
+    From SDK shim to eBPF kernel probes — works everywhere
+  </Card>
+  <Card title="Multi-Agent Governance" icon="users" href="/advanced/multi-agent">
+    Session state, budgets, and cross-agent coordination
+  </Card>
+</CardGroup>
 
-## Create beautiful pages
+## Quick Start
 
-Everything you need to create world-class documentation.
+<CardGroup cols={3}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get running in 60 seconds
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Install via Homebrew, Docker, or Go
+  </Card>
+  <Card title="Python SDK" icon="python" href="/integrations/python-sdk">
+    Integrate with the govern() decorator
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Architecture Principle
 
-## Need inspiration?
+Every successful infrastructure control plane — Terraform, Vault, Datadog, OPA — was built on one architecture decision: **unified core + thin adapters**. Faramesh follows the same model.
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Info>
+One policy engine. One DPR chain. Multiple adapters (SDK, daemon, proxy, serverless, MCP, eBPF) that all share the same invariant core.
+</Info>
+
+## Learn More
+
+<CardGroup cols={2}>
+  <Card title="Core Concepts" icon="book" href="/concepts/architecture">
+    Understand the architecture and design
+  </Card>
+  <Card title="Policy Reference" icon="file-lines" href="/policy/syntax">
+    Write governance policies
+  </Card>
+  <Card title="CLI Reference" icon="terminal" href="/cli/demo">
+    Explore all commands
+  </Card>
+  <Card title="Cloud Platform" icon="cloud" href="/advanced/cloud-platform">
+    Advanced features and fleet management
+  </Card>
+</CardGroup>

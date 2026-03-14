@@ -1,0 +1,274 @@
+---
+title: Policy Syntax
+description: Complete YAML schema specification for Faramesh Policy Language
+---
+
+Faramesh policies are YAML documents validated against a versioned schema. This page documents the complete FPL v1.0 syntax.
+
+## Top-Level Fields
+
+<ParamField path="faramesh-version" type="string" required>
+  FPL version string. Current version: `"1.0"`
+  
+  ```yaml
+  faramesh-version: "1.0"
+  ```
+</ParamField>
+
+<ParamField path="agent-id" type="string" required>
+  Unique identifier for the agent governed by this policy
+  
+  ```yaml
+  agent-id: payment-agent
+  ```
+</ParamField>
+
+<ParamField path="default_effect" type="string" default="permit">
+  Effect when no rule matches. Valid values: `permit`, `deny`
+  
+  ```yaml
+  default_effect: deny  # fail-closed by default
+  ```
+</ParamField>
+
+## vars Section
+
+Define reusable variables accessible in rule expressions:
+
+<ParamField path="vars" type="object">
+  Key-value map of variables. Values can be primitives, arrays, or objects.
+  
+  ```yaml
+  vars:
+    max_refund: 500
+    max_email_recipients: 50
+    allowed_domains:
+      - internal.example.com
+      - api.company.com
+  ```
+</ParamField>
+
+Access vars in expressions: `vars["max_refund"]`, `vars["allowed_domains"]`
+
+## tools Section
+
+Declare metadata about governed tools:
+
+<ParamField path="tools" type="object">
+  Map of tool ID to tool metadata
+  
+  ```yaml
+  tools:
+    stripe/refund:
+      reversibility: compensatable
+      blast_radius: external
+      shadow_safe: false
+      tags: [financial]
+      cost_usd: 0.01
+      
+    shell/run:
+      reversibility: irreversible
+      blast_radius: local
+      shadow_safe: false
+      tags: [system]
+      
+    read_customer:
+      reversibility: read_only
+      blast_radius: none
+      tags: [pii_source]
+  ```
+</ParamField>
+
+### Tool Metadata Fields
+
+<ParamField path="tools.*.reversibility" type="string">
+  How the tool's effects can be undone:
+  - `read_only` — no side effects
+  - `reversible` — automatically reversible
+  - `compensatable` — requires compensation action
+  - `irreversible` — cannot be undone
+</ParamField>
+
+<ParamField path="tools.*.blast_radius" type="string">
+  Scope of impact:
+  - `none` — no side effects
+  - `local` — affects only local system
+  - `external` — affects external systems/users
+  - `high` — wide-reaching impact
+</ParamField>
+
+<ParamField path="tools.*.shadow_safe" type="boolean">
+  Whether this tool can safely run in shadow mode (observability without production impact)
+</ParamField>
+
+<ParamField path="tools.*.tags" type="array">
+  Classification tags: `financial`, `pii_source`, `system`, `communication`
+</ParamField>
+
+<ParamField path="tools.*.cost_usd" type="number">
+  Estimated cost in USD per call. Used for budget enforcement.
+</ParamField>
+
+## rules Section
+
+Ordered list of governance rules. First match wins.
+
+<ParamField path="rules" type="array" required>
+  Array of rule objects
+  
+  ```yaml
+  rules:
+    - id: deny-destructive-shell
+      match:
+        tool: shell/run
+        when: 'args["cmd"] matches "rm\\s+-[rf]"'
+      effect: deny
+      reason: destructive shell command blocked by policy
+      reason_code: DESTRUCTIVE_SHELL_COMMAND
+      incident_category: destructive_command
+      incident_severity: critical
+  ```
+</ParamField>
+
+See [Rules Reference](/policy/rules) for complete rule structure.
+
+## budget Section
+
+Define cost and call limits enforced pre-execution:
+
+<ParamField path="budget" type="object">
+  ```yaml
+  budget:
+    daily_usd: 10.00
+    session_usd: 5.00
+    max_calls: 500
+    on_exceed: deny
+  ```
+</ParamField>
+
+<ParamField path="budget.daily_usd" type="number">
+  Maximum USD spend per calendar day (persisted, survives restarts)
+</ParamField>
+
+<ParamField path="budget.session_usd" type="number">
+  Maximum USD spend per session
+</ParamField>
+
+<ParamField path="budget.max_calls" type="number">
+  Maximum total tool calls per session (all tools)
+</ParamField>
+
+<ParamField path="budget.on_exceed" type="string">
+  Effect when a limit is hit: `deny` or `defer`
+</ParamField>
+
+## Complete Example
+
+Here's a complete policy from `policies/demo.yaml`:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: demo-agent
+default_effect: permit
+
+vars:
+  max_refund: 500
+  max_email_recipients: 50
+  allowed_domains:
+    - internal.example.com
+    - api.company.com
+
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial]
+  shell/run:
+    reversibility: irreversible
+    blast_radius: local
+    shadow_safe: false
+    tags: [system]
+  send_email:
+    reversibility: irreversible
+    blast_radius: external
+    shadow_safe: false
+    tags: [communication]
+  read_customer:
+    reversibility: read_only
+    blast_radius: none
+    tags: [pii_source]
+
+rules:
+  # Deny destructive shell commands before they run.
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs" || args["cmd"] matches "dd if="'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+    incident_category: destructive_command
+    incident_severity: critical
+
+  # Require human approval for high-value refunds.
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold and requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+    incident_category: financial_threshold
+    incident_severity: high
+
+  # Deny mass email operations without approval.
+  - id: deny-mass-email
+    match:
+      tool: send_email
+      when: 'len(args["recipients"]) > vars["max_email_recipients"]'
+    effect: deny
+    reason: mass email to more than 50 recipients requires manual review
+    reason_code: MASS_EMAIL_LIMIT
+    incident_category: mass_operation
+    incident_severity: medium
+
+  # Permit normal refunds under the threshold.
+  - id: permit-normal-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] <= vars["max_refund"]'
+    effect: permit
+    reason: refund within authorized threshold
+    reason_code: WITHIN_THRESHOLD
+```
+
+## Advanced Extensions (v1.0)
+
+FPL v1.0 includes advanced extensions for enterprise deployments:
+
+- **phase_transitions** — Rules for transitioning between workflow phases
+- **phase_enforcement** — Behavior when a tool is called outside its phase
+- **session_state_policy** — Governs reads/writes to shared session state
+- **cross_session_guards** — Detect accumulation attacks across sessions
+- **defer_priority** — Triage and SLA configuration for DEFER events
+- **parallel_budget** — Aggregate cost limits across parallel agents
+- **loop_governance** — Critique/loop pattern governance
+- **orchestrator_manifest** — Permitted sub-agent invocations
+- **tool_schemas** — Versioned schemas for governed tools
+- **chain_policies** — Post-hoc validation over complete session history
+- **output_policies** — Govern synthesized LLM outputs
+- **execution_isolation** — Sandbox/microVM requirements per tool
+
+These extensions are documented in `internal/core/policy/schema.go`.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Rules Reference" icon="gavel" href="/policy/rules">
+    Rule structure and match conditions
+  </Card>
+  <Card title="Expressions" icon="brackets-curly" href="/policy/expressions">
+    expr-lang syntax and operators
+  </Card>
+</CardGroup>

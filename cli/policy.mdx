@@ -1,0 +1,333 @@
+---
+title: faramesh policy
+description: Policy lifecycle commands - validate, inspect, test, and diff policy files
+---
+
+## Overview
+
+The `faramesh policy` command group provides tools for managing policy files throughout their lifecycle: validation, inspection, testing, and version comparison.
+
+## Subcommands
+
+### validate
+
+Validate a policy file for syntax, structure, and compilation errors.
+
+```bash
+faramesh policy validate <policy.yaml>
+```
+
+#### What It Checks
+
+1. **YAML syntax** — Valid YAML structure
+2. **Schema validation** — Required fields present and correctly typed
+3. **Rule structure** — Valid `match`, `effect`, and `when` clauses
+4. **expr-lang compilation** — All `when` conditions compile to bytecode
+5. **Reference validation** — Variables, selectors, and tool references exist
+
+#### Exit Codes
+
+- **0**: Policy is valid
+- **1**: Policy has errors
+
+#### Example Output
+
+**Valid policy:**
+
+```bash
+$ faramesh policy validate payment.yaml
+✓ payment.yaml  [v1.0]  3 rules  agent=payment-bot
+```
+
+**Invalid policy:**
+
+```bash
+$ faramesh policy validate payment.yaml
+✗ parse error: line 12: unknown field 'whenn' (did you mean 'when'?)
+```
+
+**Policy with warnings:**
+
+```bash
+$ faramesh policy validate payment.yaml
+  ⚠ rule 'deny-destructive-shell' has no reason_code (recommended for audit trail)
+  ⚠ variable 'max_amount' is defined but never used
+✓ payment.yaml  [v1.0]  3 rules  agent=payment-bot  (2 warning(s))
+```
+
+#### CI Integration
+
+```yaml
+# .github/workflows/policy-ci.yml
+name: Policy Validation
+on: [push, pull_request]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: faramesh/setup-faramesh@v1
+      - run: faramesh policy validate policies/*.yaml
+```
+
+---
+
+### inspect
+
+Show a compiled policy summary with rules, tools, and metadata.
+
+```bash
+faramesh policy inspect <policy.yaml>
+```
+
+#### Example Output
+
+```bash
+$ faramesh policy inspect payment.yaml
+Policy: payment.yaml
+  version    : v1.0
+  agent-id   : payment-bot
+  fpl        : 1.0
+  rules      : 5
+  tools      : 3 declared
+  default    : permit
+
+Rules:
+  permit   get-currency-rate              tool=get_exchange_rate
+  deny     deny-destructive-shell         tool=shell/run  when="args[\"cmd\"] matches \"rm\\\\s+-[rf]\""
+  permit   read-customer-allowed          tool=read_customer
+  defer    defer-high-value-refund        tool=stripe/refund  when="args[\"amount\"] > vars[\"max_refund\"]"
+  deny     deny-mass-email                tool=send_email  when="len(args[\"recipients\"]) > 50"
+```
+
+---
+
+### test
+
+Evaluate a single tool call against a policy without a running daemon.
+
+```bash
+faramesh policy test <policy.yaml> --tool <tool-id> --args <json> [flags]
+```
+
+#### Flags
+
+<ParamField path="--tool" type="string" required>
+  Tool ID to test against the policy.
+</ParamField>
+
+<ParamField path="--args" type="string" default="{}">
+  Tool arguments as JSON object.
+</ParamField>
+
+<ParamField path="--json" type="boolean" default="false">
+  Output full decision as JSON instead of human-readable format.
+</ParamField>
+
+#### Examples
+
+**Test a high-value refund:**
+
+```bash
+$ faramesh policy test payment.yaml \
+  --tool stripe/refund \
+  --args '{"amount":12000,"currency":"usd"}'
+
+  Tool:    stripe/refund
+  Effect:  DEFER
+  Rule:    defer-high-value-refund
+  Reason:  refund exceeds threshold — requires finance approval
+  Code:    HIGH_VALUE_REFUND
+```
+
+**Test a destructive shell command:**
+
+```bash
+$ faramesh policy test payment.yaml \
+  --tool shell/run \
+  --args '{"cmd":"rm -rf /"}'
+
+  Tool:    shell/run
+  Effect:  DENY
+  Rule:    deny-destructive-shell
+  Reason:  destructive shell command blocked by policy
+  Code:    DESTRUCTIVE_SHELL_COMMAND
+```
+
+**JSON output:**
+
+```bash
+$ faramesh policy test payment.yaml \
+  --tool stripe/refund \
+  --args '{"amount":100}' \
+  --json
+```
+
+```json
+{
+  "effect": "PERMIT",
+  "rule_id": "",
+  "reason": "",
+  "reason_code": "",
+  "latency": "147µs",
+  "policy_version": "abc123"
+}
+```
+
+#### Use Cases
+
+- **Policy authoring**: Test rules as you write them
+- **CI validation**: Verify expected outcomes for known inputs
+- **Documentation**: Generate examples for policy documentation
+- **Debugging**: Understand why a decision was made
+
+---
+
+### diff
+
+Compare two policy versions and show rule-level changes.
+
+```bash
+faramesh policy diff <old.yaml> <new.yaml>
+```
+
+#### Example Output
+
+```bash
+$ faramesh policy diff policies/v1.yaml policies/v2.yaml
+
+Policy diff
+  old: policies/v1.yaml  [v1.0]  5 rules
+  new: policies/v2.yaml  [v2.0]  6 rules
+
+  + defer-large-db-query              defer
+  ~ defer-high-value-refund           defer → deny
+  - allow-internal-shell              permit
+```
+
+#### Change Indicators
+
+- <span style={{color: '#16a34a'}}>**+ rule-id**</span> — Rule added in new version
+- <span style={{color: '#eab308'}}>**~ rule-id**</span> — Rule modified (effect, when, or tool changed)
+- <span style={{color: '#dc2626'}}>**- rule-id**</span> — Rule removed in new version
+
+#### Use Cases
+
+- **Pre-deployment review**: Understand impact before updating policy
+- **Change log generation**: Document policy changes between releases
+- **Rollback safety**: Verify rollback will restore expected behavior
+
+---
+
+## Policy File Structure
+
+A complete policy file example:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: payment-bot
+default_effect: permit
+
+vars:
+  max_refund: 500
+  max_email_recipients: 50
+
+tools:
+  - id: stripe/refund
+    schema:
+      amount: float
+      currency: string
+
+rules:
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs"'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold — requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+
+  - id: deny-mass-email
+    match:
+      tool: send_email
+      when: 'len(args["recipients"]) > vars["max_email_recipients"]'
+    effect: deny
+    reason: mass email requires manual review
+    reason_code: MASS_EMAIL_LIMIT
+```
+
+### Key Fields
+
+<ParamField path="faramesh-version" type="string" required>
+  Policy language version. Currently `'1.0'`.
+</ParamField>
+
+<ParamField path="agent-id" type="string" required>
+  Unique identifier for the agent this policy governs.
+</ParamField>
+
+<ParamField path="default_effect" type="string" default="deny">
+  Default effect when no rules match. Options: `permit`, `deny`, `defer`.
+</ParamField>
+
+<ParamField path="vars" type="object">
+  Named constants accessible in `when` conditions via `vars["name"]`.
+</ParamField>
+
+<ParamField path="rules" type="array" required>
+  Ordered list of governance rules. First matching rule wins.
+</ParamField>
+
+## expr-lang Conditions
+
+The `when` clause uses [expr-lang](https://github.com/expr-lang/expr) expressions:
+
+### Available Variables
+
+- `args` — Tool arguments as a map
+- `vars` — Policy variables
+- `agent_id` — Current agent identifier
+- `session_id` — Current session identifier
+- `tool_id` — Tool being invoked
+
+### Common Patterns
+
+**Threshold checks:**
+```yaml
+when: 'args["amount"] > 1000'
+```
+
+**String matching:**
+```yaml
+when: 'args["cmd"] matches "rm\\s+-[rf]"'
+```
+
+**List operations:**
+```yaml
+when: 'len(args["recipients"]) > 50'
+```
+
+**Logical operators:**
+```yaml
+when: 'args["env"] == "prod" && args["amount"] > vars["max_amount"]'
+```
+
+**Nested fields:**
+```yaml
+when: 'args["user"]["role"] != "admin"'
+```
+
+## Related Commands
+
+- [`faramesh init`](/cli/init) — Generate policy skeleton
+- [`faramesh serve`](/cli/serve) — Start daemon with policy
+- [`faramesh demo`](/cli/demo) — See example policy in action

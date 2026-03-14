@@ -1,0 +1,363 @@
+---
+title: faramesh auth
+description: Authenticate with Faramesh Horizon cloud platform
+---
+
+## Overview
+
+The `faramesh auth` command group manages authentication with [Faramesh Horizon](/advanced/cloud-platform), the cloud platform for fleet management, compliance exports, and DPR sync.
+
+## Subcommands
+
+### login
+
+Authenticate with Faramesh Horizon.
+
+```bash
+faramesh auth login [flags]
+```
+
+#### Flags
+
+<ParamField path="--token" type="string">
+  API token from https://app.faramesh.io/settings/tokens. If not provided, you'll be prompted interactively.
+</ParamField>
+
+<ParamField path="--horizon-url" type="string" default="https://api.faramesh.io">
+  Horizon API URL. Only needed for self-hosted Horizon instances.
+</ParamField>
+
+#### Interactive Login
+
+```bash
+$ faramesh auth login
+
+Faramesh Horizon Login
+
+Get your API token from:
+  https://app.faramesh.io/settings/tokens
+
+Enter your API token: █
+```
+
+Paste your token and press Enter.
+
+#### Non-Interactive Login
+
+```bash
+faramesh auth login --token fhz_1a2b3c4d5e6f7g8h9i0j
+```
+
+Useful for CI/CD pipelines and automation.
+
+#### Example Output
+
+```bash
+$ faramesh auth login --token fhz_1a2b3c4d5e6f7g8h9i0j
+Authenticating with Horizon... 
+
+✓ Authenticated with Faramesh Horizon
+
+  User:    alice@company.com
+  Org:     Acme Corp (org_abc123)
+  Horizon: https://api.faramesh.io
+
+To sync DPR records to Horizon, run:
+  faramesh serve --policy policy.yaml --sync-horizon
+```
+
+#### Self-Hosted Horizon
+
+For self-hosted Horizon instances:
+
+```bash
+faramesh auth login \
+  --token fhz_1a2b3c4d5e6f7g8h9i0j \
+  --horizon-url https://horizon.company.com
+```
+
+#### Where Credentials Are Stored
+
+Credentials are stored in:
+- **macOS**: `~/Library/Application Support/faramesh/credentials.json`
+- **Linux**: `~/.config/faramesh/credentials.json`
+- **Windows**: `%APPDATA%\faramesh\credentials.json`
+
+File permissions are set to `0600` (owner read/write only).
+
+---
+
+### logout
+
+Remove stored Horizon credentials.
+
+```bash
+faramesh auth logout
+```
+
+#### Example
+
+```bash
+$ faramesh auth logout
+✓ Logged out of Faramesh Horizon
+```
+
+This removes the stored credentials file. You'll need to run `faramesh auth login` again to use Horizon features.
+
+---
+
+### status
+
+Show current Horizon authentication status.
+
+```bash
+faramesh auth status
+```
+
+**Alias**: `whoami`
+
+```bash
+faramesh auth whoami
+```
+
+#### Example Output
+
+**Authenticated:**
+
+```bash
+$ faramesh auth status
+
+✓ Authenticated with Faramesh Horizon
+
+  User:       alice@company.com
+  Org:        Acme Corp (org_abc123)
+  Horizon:    https://api.faramesh.io
+  Token:      fhz_1a2b...
+  Saved at:   14 Mar 26 10:00 UTC
+  Expires:    never
+```
+
+**Not authenticated:**
+
+```bash
+$ faramesh auth status
+
+Not authenticated with Faramesh Horizon
+
+Run: faramesh auth login
+```
+
+**Token expired:**
+
+```bash
+$ faramesh auth status
+
+Token expired — please re-authenticate
+
+Run: faramesh auth login
+```
+
+---
+
+## What Horizon Enables
+
+Authentication with Horizon unlocks:
+
+### DPR Sync
+
+Stream all governance decisions to Horizon for centralized audit:
+
+```bash
+faramesh auth login
+faramesh serve --policy policy.yaml --sync-horizon
+```
+
+Horizon receives:
+- Every PERMIT, DENY, DEFER decision
+- Full DPR chain with cryptographic hashes
+- Agent, tool, and policy metadata
+- Real-time dashboard and alerting
+
+### Fleet Management
+
+- Web dashboard for DEFER approvals
+- Kill switch management UI
+- Cross-agent observability
+- Role-based access control
+
+### Compliance Exports
+
+Generate compliance reports for:
+- **SOC 2**: Access control and audit trail reports
+- **HIPAA**: ePHI access logs
+- **EU AI Act**: High-risk AI system audit logs
+- **Custom**: CSV, JSON, or API export
+
+### SSO Integration
+
+Enterprise SSO providers:
+- Okta
+- Azure AD
+- Google Workspace
+- Custom SAML/OIDC
+
+<Note>
+SSO is available on Team and Enterprise plans. [Contact sales](https://faramesh.io/contact) for setup.
+</Note>
+
+---
+
+## Authentication Flow
+
+### 1. Token Generation
+
+1. Visit https://app.faramesh.io/settings/tokens
+2. Click **Generate New Token**
+3. Name the token (e.g., "production-daemon")
+4. Set expiration (never, 30 days, 90 days, 1 year)
+5. Copy the token (starts with `fhz_`)
+
+### 2. CLI Login
+
+```bash
+faramesh auth login --token fhz_...
+```
+
+The CLI:
+- Validates the token against Horizon API (`GET /v1/auth/me`)
+- Retrieves user and org metadata
+- Stores credentials locally with `0600` permissions
+
+### 3. Token Usage
+
+When `--sync-horizon` is enabled:
+- Daemon reads stored credentials on startup
+- Validates token hasn't expired
+- Opens gRPC stream to Horizon API
+- Includes token in `Authorization: Bearer` header
+- Streams DPR records in batches
+
+### 4. Token Expiration
+
+Tokens expire based on the expiration you set during generation. When expired:
+
+```bash
+$ faramesh serve --policy policy.yaml --sync-horizon
+Error: Horizon token expired
+Run: faramesh auth login
+```
+
+Generate a new token and login again.
+
+---
+
+## Security Best Practices
+
+### Token Storage
+
+- **Never** commit tokens to version control
+- Store tokens in environment variables for CI/CD:
+  ```bash
+  export FARAMESH_TOKEN="fhz_..."
+  faramesh auth login --token "$FARAMESH_TOKEN"
+  ```
+- Use short-lived tokens for development
+- Rotate tokens regularly
+
+### Token Scopes
+
+Tokens have scopes that control permissions:
+- `dpr:write` — Stream DPR records to Horizon
+- `fleet:read` — Read agent status
+- `fleet:write` — Approve/deny DEFER, activate kill switches
+- `policy:write` — Upload policy packs to Hub
+- `admin` — Full org access
+
+Generate tokens with minimal required scopes.
+
+### Token Rotation
+
+```bash
+# Generate new token in Horizon UI
+# Login with new token
+faramesh auth login --token fhz_new_token
+
+# Revoke old token in Horizon UI
+```
+
+---
+
+## CI/CD Integration
+
+### GitHub Actions
+
+```yaml
+name: Deploy Governed Agent
+on: push
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: faramesh/setup-faramesh@v1
+      
+      - name: Authenticate with Horizon
+        run: |
+          faramesh auth login --token "${{ secrets.FARAMESH_TOKEN }}"
+      
+      - name: Start daemon with Horizon sync
+        run: |
+          faramesh serve --policy policy.yaml --sync-horizon &
+```
+
+### GitLab CI
+
+```yaml
+deploy:
+  script:
+    - faramesh auth login --token "$FARAMESH_TOKEN"
+    - faramesh serve --policy policy.yaml --sync-horizon &
+  variables:
+    FARAMESH_TOKEN: $FARAMESH_TOKEN
+```
+
+---
+
+## Troubleshooting
+
+### "invalid token"
+
+- Token may be expired — generate a new one
+- Token may have been revoked — check Horizon UI
+- Copy/paste error — ensure no extra spaces
+
+### "Could not reach Horizon API"
+
+- Check network connectivity
+- Verify `--horizon-url` if self-hosted
+- Check firewall rules
+
+The CLI allows offline token storage with a warning:
+
+```
+⚠ Could not reach Horizon API — storing token for when connectivity is available
+```
+
+### "Not authenticated"
+
+Run `faramesh auth status` to check authentication state:
+
+```bash
+faramesh auth status
+# If not authenticated:
+faramesh auth login
+```
+
+---
+
+## Related Commands
+
+- [`faramesh serve --sync-horizon`](/cli/serve) — Stream DPR to Horizon
+- [`faramesh audit tail`](/cli/audit#tail) — Local audit stream (no auth required)
+- [`faramesh demo`](/cli/demo) — Try governance without Horizon

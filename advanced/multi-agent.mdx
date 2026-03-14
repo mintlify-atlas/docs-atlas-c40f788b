@@ -1,0 +1,344 @@
+---
+title: Multi-Agent Governance
+description: Orchestrate multiple agents with shared budgets, loop detection, and cross-agent coordination
+---
+
+Faramesh provides production-grade governance for multi-agent systems where agents invoke other agents, share resources, or produce aggregated outputs.
+
+## Architecture
+
+Multi-agent governance operates across several dimensions:
+
+- **Agent linkage tracking** — Bidirectional DPR chains across agent invocations
+- **Routing manifests** — Declared, governed invocation graphs
+- **Budget sharing** — Aggregate cost limits enforced across fan-out scenarios
+- **Loop detection** — Convergence tracking for critique/refinement loops
+- **Session state isolation** — Namespace-scoped state with cross-agent sanitization
+- **Output aggregation** — Entity extraction and redaction in synthesized outputs
+
+<Info>
+Multi-agent features are available in the open-source distribution. Cloud-tier features include cross-org swarm policies and fleet-wide coordination.
+</Info>
+
+---
+
+## Agent Linkage
+
+When Agent A invokes Agent B, Faramesh records a **bidirectional DPR link**:
+
+```go
+type InvocationLink struct {
+    OuterAgentID string // Agent A
+    OuterDPRID   string // A's DPR record for the invocation
+    InnerAgentID string // Agent B
+    InnerDPRID   string // B's governance decision
+    SessionID    string
+}
+```
+
+### Use Cases
+
+**Audit trail reconstruction:**
+```bash
+faramesh audit chain --dpr-id abc123
+# Shows full invocation chain: orchestrator → planner → executor
+```
+
+**Cross-agent attribution:**
+```yaml
+rules:
+  - id: restrict-nested-db-access
+    match:
+      tool: db/write
+      when: 'delegation.depth > 2'
+    effect: deny
+    reason: nested agents cannot write to database
+```
+
+Linkage is tracked automatically by the `LinkageManager` in `internal/core/multiagent/linkage.go`.
+
+---
+
+## Routing Manifests
+
+Orchestrators must declare which sub-agents they may invoke. Undeclared invocations are denied.
+
+### Policy Configuration
+
+```yaml
+faramesh-version: '1.0'
+agent-id: orchestrator
+
+routing:
+  entries:
+    - agent_id: research-agent
+      max_invocations_per_session: 5
+      requires_prior_approval: false
+    
+    - agent_id: payment-agent
+      max_invocations_per_session: 1
+      requires_prior_approval: true
+  
+  undeclared_policy: deny  # or "defer" to require approval
+
+rules:
+  - id: permit-invoke-agent
+    match:
+      tool: invoke_agent
+    effect: permit
+```
+
+### Enforcement
+
+The `RoutingGovernor` enforces:
+- **Manifest compliance** — Only declared agents can be invoked
+- **Invocation limits** — Per-session caps prevent runaway delegation
+- **Approval gates** — Sensitive sub-agents require human approval
+
+```bash
+# Example denial
+[12:04:15] DENY invoke_agent agent=unauthorized-agent
+           reason=UNDECLARED_INVOCATION
+           policy=deny-undeclared-invocations
+```
+
+---
+
+## Shared Budget Management
+
+In parallel multi-agent scenarios (fan-out), agents share a total budget. Exceeding any limit cancels all remaining agents.
+
+### Configuration
+
+```yaml
+budget:
+  aggregate_max_usd: 10.00
+  allocations:
+    - agent_id: research-1
+      max_cost_usd: 3.00
+    - agent_id: research-2
+      max_cost_usd: 3.00
+    - agent_id: research-3
+      max_cost_usd: 4.00
+  on_exceed: cancel_remaining
+```
+
+### Runtime Behavior
+
+```go
+// Allocate budget slices
+bm := multiagent.NewBudgetManager(sessionID, 10.0)
+bm.AllocateAgent("research-1", 3.0)
+bm.AllocateAgent("research-2", 3.0)
+
+// Record cost
+shouldCancel, _ := bm.RecordCost("research-1", 3.50)
+if shouldCancel {
+    // Agent exceeded limit, cancel it
+}
+
+// Check aggregate
+status := bm.Status()
+fmt.Printf("Aggregate spent: $%.2f / $%.2f\n", 
+    status.AggregateSpent, status.AggregateMax)
+```
+
+<Warning>
+When the aggregate budget is exceeded, **all running agents are cancelled immediately** to prevent overspend.
+</Warning>
+
+---
+
+## Loop Detection
+
+For iterative refinement patterns (generator + critic), Faramesh tracks convergence and enforces limits.
+
+### Loop Configuration
+
+```yaml
+loops:
+  - loop_id: code-refinement
+    max_iterations: 10
+    max_total_cost_usd: 5.00
+    max_duration: 5m
+    min_improvement_pct: 5.0
+    on_max_reached: deny
+```
+
+### Tracking Convergence
+
+```go
+lg := multiagent.NewLoopGovernor()
+lg.StartLoop(config)
+
+for i := 0; i < maxIter; i++ {
+    score := runCriticLoop()
+    canContinue, reason := lg.RecordIteration(
+        loopID, agentID, score, cost)
+    
+    if !canContinue {
+        log.Printf("Loop stopped: %s", reason)
+        break
+    }
+}
+```
+
+### Stop Conditions
+
+- **MAX_ITERATIONS_REACHED** — Hit iteration limit
+- **MAX_COST_REACHED** — Budget exhausted
+- **MAX_DURATION_REACHED** — Timeout
+- **CONVERGED** — Improvement < minimum threshold
+
+---
+
+## Session State Governance
+
+Multi-agent sessions share state, but each agent operates in a namespaced scope.
+
+### Namespace Isolation
+
+```go
+// Agent "billing" writes to its own namespace
+ns := multiagent.NewStateNamespace("billing")
+key := ns.ScopedKey("customer_id")  // "agent:billing:customer_id"
+
+// Cross-agent reads require "shared:" prefix
+sharedKey := "shared:request_id"
+if multiagent.SharedKey(sharedKey) {
+    // Allowed
+}
+```
+
+### Write Scanning
+
+Before writes, values are scanned for:
+- **Injection patterns** — XSS, SQL injection
+- **PII** — Email, SSN, credit cards
+- **Secrets** — API keys, passwords
+
+```go
+sg := multiagent.NewSessionGovernor()
+canWrite, result := sg.CanWrite(agentID, key, value)
+
+if !canWrite {
+    log.Printf("Write blocked: %v", result.Violations)
+}
+```
+
+### Read Sanitization
+
+Cross-agent reads are sanitized:
+
+```go
+sanitized := sg.SanitizeForRead(value)
+// PII patterns replaced with [REDACTED]
+```
+
+---
+
+## Output Aggregation
+
+When multiple agents produce outputs that are synthesized into a final result, `govern_output` rules apply.
+
+### Aggregation Policy
+
+```yaml
+aggregate_output:
+  max_output_length: 5000
+  blocked_entity_types:
+    - email
+    - ssn
+    - credential
+  require_all_sources: false
+  min_sources: 2
+```
+
+### Entity Extraction
+
+The `AggregationGovernor` scans synthesized output for:
+- Email addresses
+- IP addresses
+- Credentials (API keys, passwords)
+- SSNs
+- Credit card numbers
+
+Blocked entity types are redacted before the output reaches the user.
+
+### Example
+
+```go
+ag := multiagent.NewAggregationGovernor(policy)
+result := AggregateResult{
+    SessionID: sessionID,
+    Sources: []AggregationSource{
+        {AgentID: "research-1", Output: "..."},
+        {AgentID: "research-2", Output: "..."},
+    },
+    Synthesized: combinedOutput,
+}
+
+output, entities, err := ag.GovernOutput(result)
+if err != nil {
+    // Aggregation blocked (e.g., min_sources not met)
+}
+```
+
+---
+
+## Cross-Agent Coordination
+
+Faramesh supports coordination primitives for swarm scenarios.
+
+### Phase Management
+
+Agents can be restricted to specific workflow phases:
+
+```yaml
+phases:
+  - name: planning
+    allowed_tools:
+      - search
+      - retrieve_context
+  
+  - name: execution
+    allowed_tools:
+      - db/write
+      - api/call
+```
+
+### Cryptographic Seals
+
+Session outputs can be sealed to prevent tampering:
+
+```yaml
+seals:
+  require_seal: true
+  signer_agent_id: orchestrator
+```
+
+---
+
+## Best Practices
+
+<Info>
+**Start with routing manifests** — Declare your agent graph before deploying.
+</Info>
+
+<Warning>
+**Aggregate budgets require careful capacity planning** — Ensure total allocations don't exceed the aggregate limit.
+</Warning>
+
+1. **Use linkage tracking for audit compliance** — Cross-agent DPR chains provide full lineage
+2. **Enforce loop limits in production** — Prevent runaway refinement costs
+3. **Namespace session state** — Prevent cross-agent interference
+4. **Scan aggregated outputs** — Entity extraction catches PII leaks
+5. **Test routing policies in shadow mode** — Validate manifests before enforcement
+
+---
+
+## Related Docs
+
+- [Policy Configuration](/policy/overview) — Write multi-agent policy rules
+- [Budget Enforcement](/advanced/multi-agent) — Cost governance across agents
+- [Observability](/advanced/observability) — Track multi-agent metrics

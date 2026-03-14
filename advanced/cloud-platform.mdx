@@ -1,0 +1,403 @@
+---
+title: Cloud Platform
+description: Advanced features, fleet management, and compliance exports via Faramesh Cloud
+---
+
+Faramesh Cloud extends the open-source core with advanced capabilities for production deployments, compliance, and fleet management.
+
+<Info>
+All core features are available in the open-source distribution. Cloud adds plan-gated advanced capabilities.
+</Info>
+
+---
+
+## Open Source vs. Cloud
+
+Faramesh follows an **open core + cloud model**. Every tool ships with full functionality, and advanced features are plan-gated via Faramesh Cloud.
+
+### Feature Comparison
+
+| Tier | What You Get | Auth Required? |
+|------|-------------|----------------|
+| **Community** | Full core functionality — policies, budgets, observation, signing, SBOM, delegation | No |
+| **Pro** | Cloud sync, rolling window budgets, cloud registry, cloud attestation | Yes (free account) |
+| **Team** | Anomaly detection, cost forecasting, private packs, cross-org swarm | Yes (Team plan) |
+| **Enterprise** | Fleet management, compliance exports, org-wide policies, fleet budgets | Yes (Enterprise plan) |
+
+---
+
+## Authentication
+
+Connect to Faramesh Cloud to unlock advanced features.
+
+### Login
+
+```bash
+faramesh auth login
+```
+
+**Interactive flow:**
+
+```
+Opening browser to authenticate...
+✓ Authenticated as user@company.com
+✓ Organization: Acme Corp
+✓ Plan: Team
+
+Advanced features unlocked:
+  • Cloud sync
+  • Anomaly detection
+  • Private policy packs
+  • Cross-org swarm policies
+```
+
+### API Token Authentication
+
+For CI/CD environments:
+
+```bash
+export FARAMESH_TOKEN=fm_abc123...
+faramesh auth status
+```
+
+**Token scopes:**
+
+- `read:policies` — Read policy packs
+- `write:policies` — Publish policy packs
+- `read:audit` — Read DPR records
+- `write:audit` — Upload audit trails
+- `admin:fleet` — Manage fleet policies
+
+### Logout
+
+```bash
+faramesh auth logout
+```
+
+---
+
+## Fleet Management (Enterprise)
+
+Manage governance across hundreds of agents from a single control plane.
+
+### Fleet Policies
+
+Deploy org-wide policies that override local agent policies.
+
+**Example:**
+
+```yaml
+# fleet-policy.yaml (managed in Faramesh Cloud)
+faramesh-version: '1.0'
+fleet: true
+org: acme-corp
+
+rules:
+  # This rule applies to ALL agents in the org
+  - id: fleet-deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]"'
+    effect: deny
+    reason: destructive shell commands blocked by fleet policy
+    reason_code: FLEET_DESTRUCTIVE_SHELL
+```
+
+**Deploy:**
+
+```bash
+faramesh fleet deploy fleet-policy.yaml
+```
+
+**Status:**
+
+```bash
+faramesh fleet status
+```
+
+**Output:**
+
+```
+Fleet Policy Status
+  • 247 agents enrolled
+  • 245 agents compliant
+  • 2 agents pending update
+  
+  Last deployed: 2026-03-14 10:00:00 UTC
+  Policy version: v1.2.3
+```
+
+---
+
+## Compliance Exports (Enterprise)
+
+Generate compliance-ready audit exports for regulatory frameworks.
+
+### Supported Frameworks
+
+- **SOC 2 Type II** — Access control, audit logging, change management
+- **HIPAA** — Access to PHI, audit trails, encryption at rest
+- **EU AI Act** — High-risk AI system governance, decision logging
+- **ISO 27001** — Information security controls
+
+### Generate Export
+
+**SOC 2:**
+
+```bash
+faramesh compliance export soc2 \
+  --start 2026-01-01 \
+  --end 2026-12-31 \
+  --output soc2-audit-2026.pdf
+```
+
+**HIPAA:**
+
+```bash
+faramesh compliance export hipaa \
+  --start 2026-01-01 \
+  --end 2026-12-31 \
+  --output hipaa-audit-2026.pdf
+```
+
+**EU AI Act:**
+
+```bash
+faramesh compliance export eu-ai-act \
+  --start 2026-01-01 \
+  --end 2026-12-31 \
+  --system-id customer-support-agent \
+  --output eu-ai-act-2026.pdf
+```
+
+### Export Contents
+
+**SOC 2 Export includes:**
+
+- Access control audit trail (all governance decisions)
+- DEFER approvals and denials
+- Policy changes with change control metadata
+- DPR chain verification (tamper-evidence)
+- Incident prevention metrics
+
+**HIPAA Export includes:**
+
+- PHI access logs (read/write to protected data)
+- Principal identity verification
+- Encryption status (credentials, session state)
+- Breach notification timeline (if applicable)
+
+**EU AI Act Export includes:**
+
+- Decision provenance (input → output lineage)
+- Human oversight records (DEFER approvals)
+- Model version tracking
+- Risk assessment documentation
+
+---
+
+## Cost Analytics (Team+)
+
+Track and forecast LLM/API costs across your agent fleet.
+
+### Dashboard
+
+```bash
+faramesh cloud dashboard
+```
+
+**Metrics:**
+
+- **Total spend** — Aggregate across all agents
+- **Per-agent breakdown** — Which agents cost the most?
+- **Per-tool breakdown** — Which tools are expensive?
+- **Cost trends** — Daily/weekly/monthly
+
+### Anomaly Detection (Team+)
+
+Detect unusual cost patterns:
+
+```bash
+faramesh cloud anomalies
+```
+
+**Output:**
+
+```
+Cost Anomalies Detected
+  • payment-agent: $47.23 (expected: $12.50, +278%)
+    → Spike detected at 2026-03-14 08:15:00 UTC
+    → Root cause: 347 refund operations (typical: 50/day)
+  
+  • research-agent: $89.12 (expected: $25.00, +256%)
+    → New tool usage: expensive_search (cost: $0.50/call)
+```
+
+### Cost Forecasting (Team+)
+
+```bash
+faramesh cloud forecast --period 30d
+```
+
+**Output:**
+
+```
+30-Day Cost Forecast
+  • Current spend: $1,247.50
+  • Forecasted spend: $1,890.00 (+51%)
+  • Breakdown:
+    - LLM calls: $1,200 (↑45%)
+    - API calls: $450 (↑60%)
+    - Database: $240 (→ flat)
+```
+
+---
+
+## Managed Approval Workflows (Team+)
+
+Centralized DEFER approval management for your organization.
+
+### Approval Dashboard
+
+View and approve pending DEFER decisions from a web UI:
+
+```bash
+faramesh cloud approvals
+```
+
+**Features:**
+
+- **Slack integration** — Approve via Slack reactions
+- **Email notifications** — Digest of pending approvals
+- **Approval policies** — Auto-approve based on conditions
+- **Approval delegation** — Assign approvers by tool/agent
+
+### Auto-Approval Rules
+
+```yaml
+auto_approval:
+  - name: auto-approve-low-refunds
+    condition: 'tool == "stripe/refund" && args["amount"] < 100'
+    approver: system
+  
+  - name: auto-approve-staging
+    condition: 'agent_id matches "staging-.*"'
+    approver: system
+```
+
+---
+
+## Cross-Org Swarm Policies (Team+)
+
+Govern multi-organization agent swarms with federated trust.
+
+### Swarm Configuration
+
+```yaml
+swarm:
+  org: acme-corp
+  trust:
+    - org: partner-corp
+      tools:
+        - api/billing/*
+      max_delegation_depth: 2
+      expires_at: 2027-01-01T00:00:00Z
+```
+
+### Deploy Swarm Policy
+
+```bash
+faramesh swarm deploy swarm-policy.yaml
+```
+
+**Enforcement:**
+
+When an agent from `acme-corp` invokes an agent from `partner-corp`, the trust document is verified before execution.
+
+---
+
+## Cloud Sync (Pro+)
+
+Sync DPR records and policies to Faramesh Cloud for backup and analytics.
+
+### Enable Sync
+
+```bash
+faramesh cloud sync enable
+```
+
+**What syncs:**
+
+- DPR records (SHA-256 chain verified)
+- Policy versions
+- Decision metrics
+- Incident prevention stats
+
+### Manual Sync
+
+```bash
+faramesh cloud sync now
+```
+
+---
+
+## Rolling Window Budgets (Pro+)
+
+Enforce cost limits over rolling time windows (last 24h, last 7d).
+
+**Configuration:**
+
+```yaml
+budget:
+  type: rolling_window
+  window: 24h
+  max_cost_usd: 100.00
+```
+
+**Enforcement:**
+
+Faramesh tracks spend over the last 24 hours. If the rolling sum exceeds $100, the agent is rate-limited.
+
+---
+
+## Private Policy Packs (Team+)
+
+Publish and share policy packs within your organization.
+
+### Publish
+
+```bash
+faramesh pack publish ./policies --org acme-corp --private
+```
+
+### Install
+
+```bash
+faramesh pack install @acme-corp/payment-governance
+```
+
+---
+
+## Best Practices
+
+<Info>
+**Use fleet policies for org-wide standards** — Ensure all agents comply with baseline rules.
+</Info>
+
+1. **Enable cloud sync for audit backups** — DPR records replicated to Cloud
+2. **Monitor cost anomalies weekly** — Catch runaway agents early
+3. **Use compliance exports quarterly** — SOC 2, HIPAA readiness
+4. **Set up managed approval workflows** — Centralize DEFER approvals
+5. **Forecast costs monthly** — Plan capacity and budgets
+
+<Warning>
+**Fleet policies override local agent policies** — Test in staging before deploying org-wide.
+</Warning>
+
+---
+
+## Related Docs
+
+- [Authentication](/cli/auth) — Configure SSO and API tokens
+- [Policy Configuration](/policy/overview) — Write fleet-compatible policies
+- [Multi-Agent Governance](/advanced/multi-agent) — Cross-org swarm coordination
